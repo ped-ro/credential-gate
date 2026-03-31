@@ -134,5 +134,18 @@ rotation:
       # Requires: current token has "API Tokens: Edit" permission
       api_url: "https://api.cloudflare.com/client/v4"
 
+panic:
+  enabled: true
+  # Cooldown after unlock — prevents rapid lock/unlock cycling
+  cooldown_after_unlock_seconds: 60
+  # Auto-panic triggers — lock the gate automatically when thresholds are hit
+  auto_triggers:
+    # Lock gate if more than N requests per minute system-wide
+    requests_per_minute_critical: 50
+    # Lock gate if more than N denials per minute (brute-force indicator)
+    denials_per_minute_critical: 20
+    # Lock gate if an unknown agent ID appears in audit logs
+    unknown_agent_lockdown: true
+
 audit:
   db_path: "data/audit.db"

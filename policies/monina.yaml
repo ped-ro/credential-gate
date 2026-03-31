@@ -3,6 +3,17 @@ agent_id: monina
 # Default approval mode (can be overridden per-credential)
 default_approval: "both"  # yubikey, phone, both
 
+# Identity hardening (Phase 10)
+# Restrict which IPs and User-Agents can use this agent's API key
+identity:
+  allowed_source_ips:
+    - "127.0.0.1"         # localhost only
+  allowed_user_agents:    # warning-only (logged, not blocked)
+    - "*Claude*"
+    - "*claude*"
+    - "*httpx*"
+    - "*python-requests*"
+
 # Time windows (UTC or local with timezone)
 schedule:
   timezone: "America/Los_Angeles"

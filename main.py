@@ -25,6 +25,7 @@ import logging
 import threading
 import time
 from contextlib import asynccontextmanager
+from fnmatch import fnmatch
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -36,6 +37,7 @@ from bitwarden import BitwardenError, BitwardenSessionManager, SessionState
 from config import load_config
 from fido import AssertionResult, assert_touch
 from leases import LeaseManager, LeaseState, _ts_to_iso
+from panic import PanicManager
 from proxy import ProxyExecutor, ProxyResult, sanitize_output
 from notifications import (
     send_anomaly_notification,
@@ -43,6 +45,7 @@ from notifications import (
     send_approved_notification,
     send_auto_approve_notification,
     send_daily_digest_notification,
+    send_identity_violation_notification,
     send_lease_expired_notification,
     send_lease_revoked_notification,
     send_revoke_all_notification,
@@ -90,6 +93,9 @@ auto_vaulter = None  # type: ignore
 _last_scan_findings: list = []  # in-memory only, cleared after 10 min
 _last_scan_time: float = 0  # monotonic timestamp of last scan
 _SCAN_CACHE_TTL = 600  # 10 minutes
+
+# Phase 10: Emergency Kill + Hardened Identity
+panic_mgr: PanicManager | None = None
 
 
 @asynccontextmanager
@@ -155,6 +161,22 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Observability disabled (set observability.enabled: true to enable)")
 
+    # Initialize panic manager (Phase 10)
+    global panic_mgr
+    data_dir = str(Path(cfg["audit"]["db_path"]).parent)
+    panic_mgr = PanicManager(
+        lease_manager=lease_mgr,
+        bitwarden=bw,
+        notifier_config=cfg,
+        audit=audit_log,
+        data_dir=data_dir,
+    )
+    panic_cfg = cfg.get("panic", {})
+    cooldown = panic_cfg.get("cooldown_after_unlock_seconds", 60)
+    panic_mgr.set_cooldown(cooldown)
+    if panic_mgr.is_locked:
+        logger.critical("SERVICE STARTING IN LOCKED MODE — gate is LOCKED")
+
     # Initialize discovery & rotation (Phase 9)
     global secret_scanner, credential_rotator, auto_vaulter
     disc_cfg = cfg.get("discovery", {})
@@ -188,6 +210,7 @@ async def lifespan(app: FastAPI):
             secret_scanner=secret_scanner,
             credential_rotator=credential_rotator,
             auto_vaulter=auto_vaulter,
+            panic_manager=panic_mgr,
         )
         mcp_app = mcp_srv.streamable_http_app()
         mcp_path = mcp_cfg.get("path", "/mcp")
@@ -252,6 +275,75 @@ def _notifications_enabled() -> bool:
 
 def _auth_mode() -> str:
     return cfg.get("authorization", {}).get("mode", "yubikey")
+
+
+def _validate_agent_identity(request: Request, agent_id: str) -> None:
+    """Additional identity checks beyond API key (Phase 10).
+
+    Checks source IP against allowed_source_ips in the agent's policy file.
+    Logs a warning if User-Agent doesn't match allowed_user_agents.
+
+    Raises HTTPException(403) if source IP is not in the allowlist.
+    """
+    policies_dir = cfg.get("policies", {}).get("directory", "policies")
+    agent_policy = load_agent_policy(policies_dir, agent_id)
+    if not agent_policy:
+        return
+
+    # Read identity config from the raw policy data
+    policy_path = Path(policies_dir) / f"{agent_id}.yaml"
+    identity = {}
+    if policy_path.exists():
+        import yaml
+        try:
+            with open(policy_path) as f:
+                raw = yaml.safe_load(f) or {}
+            identity = raw.get("identity", {})
+        except Exception:
+            pass
+
+    if not identity:
+        return
+
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Check source IP
+    allowed_ips = identity.get("allowed_source_ips")
+    if allowed_ips:
+        if client_ip not in allowed_ips:
+            violation = f"Request from unauthorized IP {client_ip}"
+            logger.warning("Identity violation for %s: %s", agent_id, violation)
+
+            if _notifications_enabled():
+                send_identity_violation_notification(
+                    agent_id=agent_id,
+                    violation=violation,
+                    source_ip=client_ip,
+                    config=cfg,
+                )
+
+            audit_log.log(
+                agent_id=agent_id,
+                credential_name="identity_check",
+                status="denied",
+                purpose=f"identity_violation: {violation}",
+                ip_address=client_ip,
+            )
+
+            raise HTTPException(
+                status_code=403,
+                detail=f"Request from unauthorized IP {client_ip} for agent {agent_id}",
+            )
+
+    # Check User-Agent (non-blocking — log warning only)
+    allowed_uas = identity.get("allowed_user_agents")
+    if allowed_uas:
+        ua = request.headers.get("user-agent", "")
+        if not any(fnmatch(ua, pattern) for pattern in allowed_uas):
+            logger.warning(
+                "Unexpected User-Agent for %s: %s (expected one of %s)",
+                agent_id, ua, allowed_uas,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -366,8 +458,20 @@ async def health():
     discovery_status = "enabled" if disc_cfg.get("enabled", False) and secret_scanner else "disabled"
     rotation_status = "enabled" if rot_cfg.get("enabled", False) and credential_rotator else "disabled"
 
+    # Panic / lock status (Phase 10)
+    lock_status = panic_mgr.get_status() if panic_mgr else {"locked": False}
+    is_locked = lock_status.get("locked", False)
+
+    # Overall status: locked overrides everything
+    if is_locked:
+        overall_status = "locked"
+    elif bw_status == "active":
+        overall_status = "ok"
+    else:
+        overall_status = "degraded"
+
     return {
-        "status": "ok" if bw_status == "active" else "degraded",
+        "status": overall_status,
         "bitwarden": bw_status,
         "fido2": "ready" if has_creds else "no_credentials",
         "authorization_mode": _auth_mode(),
@@ -379,6 +483,7 @@ async def health():
         "observability": obs_status,
         "discovery": discovery_status,
         "rotation": rotation_status,
+        "panic": lock_status,
     }
 
 
@@ -506,6 +611,106 @@ async def dashboard_revoke_lease(lease_id: str, body: DashboardRevokeRequest | N
         )
 
     return {"status": "revoked", "lease_id": lease_id}
+
+
+# ---------------------------------------------------------------------------
+# Panic / Lock endpoints (Phase 10)
+# ---------------------------------------------------------------------------
+
+class PanicRequest(BaseModel):
+    reason: str
+    rotate_credentials: bool = False
+    agent_filter: str | None = None
+
+
+@app.post("/panic")
+async def trigger_panic(req: PanicRequest, request: Request):
+    """Emergency lockdown. Revokes all leases and blocks all credential access.
+
+    Requires YubiKey ONLY — no phone approval for panic (phone could be
+    compromised). Overrides any policy — panic always works regardless of
+    schedule, rate limits, etc.
+    """
+    if not panic_mgr:
+        raise HTTPException(status_code=503, detail="Panic manager not initialized")
+
+    logger.critical("PANIC requested: %s", req.reason)
+    print(
+        f"\n{'='*60}\n"
+        f"  EMERGENCY LOCKDOWN REQUEST\n"
+        f"  Reason:           {req.reason}\n"
+        f"  Rotate creds:     {req.rotate_credentials}\n"
+        f"  Agent filter:     {req.agent_filter or 'ALL'}\n"
+        f"{'='*60}\n"
+        f"  >>> Touch your YubiKey to LOCK THE GATE\n"
+    )
+
+    result = _run_fido2_assertion()
+    if not result.success:
+        audit_log.log(
+            agent_id="admin",
+            credential_name="*",
+            status="denied",
+            purpose=f"panic_attempt: {req.reason}",
+        )
+        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+
+    summary = await panic_mgr.panic(
+        reason=req.reason,
+        rotate_credentials=req.rotate_credentials,
+        agent_filter=req.agent_filter,
+    )
+    return summary
+
+
+class UnlockRequest(BaseModel):
+    reason: str
+
+
+@app.post("/unlock")
+async def unlock_gate(req: UnlockRequest, request: Request):
+    """Unlock the gate after a panic lockdown.
+
+    Requires YubiKey ONLY. Cannot be done via phone.
+    """
+    if not panic_mgr:
+        raise HTTPException(status_code=503, detail="Panic manager not initialized")
+
+    if not panic_mgr.is_locked:
+        return {"status": "already_unlocked", "message": "Gate is not locked"}
+
+    logger.info("Unlock requested: %s", req.reason)
+    print(
+        f"\n{'='*60}\n"
+        f"  GATE UNLOCK REQUEST\n"
+        f"  Reason: {req.reason}\n"
+        f"{'='*60}\n"
+        f"  >>> Touch your YubiKey to UNLOCK\n"
+    )
+
+    result = _run_fido2_assertion()
+    if not result.success:
+        audit_log.log(
+            agent_id="admin",
+            credential_name="*",
+            status="denied",
+            purpose=f"unlock_attempt: {req.reason}",
+        )
+        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+
+    summary = await panic_mgr.unlock(reason=req.reason)
+    return summary
+
+
+@app.get("/lock-status")
+async def get_lock_status():
+    """Return current lock state. No auth required.
+
+    Agents need to know why they're being rejected.
+    """
+    if not panic_mgr:
+        return {"locked": False}
+    return panic_mgr.get_status()
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +1108,9 @@ def _run_anomaly_check():
 
     Called from the expiry daemon loop. Sends Ntfy notification if new
     anomalies are detected.
+
+    Phase 10: Also checks auto-panic triggers and locks the gate if
+    critical thresholds are exceeded.
     """
     global _last_anomalies
 
@@ -931,6 +1139,97 @@ def _run_anomaly_check():
             send_anomaly_notification(anomalies, cfg)
 
     _last_anomalies = anomalies
+
+    # Phase 10: Auto-panic triggers
+    _check_auto_panic_triggers(anomalies)
+
+
+def _check_auto_panic_triggers(anomalies: list[dict]):
+    """Evaluate auto-panic triggers from config. Locks the gate if critical
+    thresholds are exceeded.
+
+    Called from the anomaly check loop (background thread).
+    """
+    if not panic_mgr or panic_mgr.is_locked:
+        return
+
+    panic_cfg = cfg.get("panic", {})
+    if not panic_cfg.get("enabled", True):
+        return
+
+    auto_triggers = panic_cfg.get("auto_triggers", {})
+    if not auto_triggers:
+        return
+
+    # Check requests_per_minute_critical
+    rpm_critical = auto_triggers.get("requests_per_minute_critical")
+    if rpm_critical and metrics_collector:
+        one_min_ago = metrics_collector._cutoff_iso_from_epoch(time.time() - 60)
+        total = metrics_collector._count(
+            metrics_collector._audit_conn,
+            "SELECT COUNT(*) FROM audit_log WHERE timestamp >= ?",
+            (one_min_ago,),
+        )
+        if total >= rpm_critical:
+            import asyncio
+            try:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(
+                    panic_mgr.auto_panic(
+                        f"Request rate critical: {total} requests/min (threshold: {rpm_critical})"
+                    )
+                )
+                loop.close()
+            except Exception as e:
+                logger.error("Auto-panic (rpm) failed: %s", e)
+            return  # already locked
+
+    # Check denials_per_minute_critical
+    dpm_critical = auto_triggers.get("denials_per_minute_critical")
+    if dpm_critical and metrics_collector:
+        one_min_ago = metrics_collector._cutoff_iso_from_epoch(time.time() - 60)
+        denials = metrics_collector._count(
+            metrics_collector._audit_conn,
+            "SELECT COUNT(*) FROM audit_log WHERE timestamp >= ? AND status = 'denied'",
+            (one_min_ago,),
+        )
+        if denials >= dpm_critical:
+            import asyncio
+            try:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(
+                    panic_mgr.auto_panic(
+                        f"Denial rate critical: {denials} denials/min (threshold: {dpm_critical})"
+                    )
+                )
+                loop.close()
+            except Exception as e:
+                logger.error("Auto-panic (dpm) failed: %s", e)
+            return
+
+    # Check unknown_agent_lockdown
+    if auto_triggers.get("unknown_agent_lockdown", False) and metrics_collector:
+        one_min_ago = metrics_collector._cutoff_iso_from_epoch(time.time() - 60)
+        rows = metrics_collector._audit_conn.execute(
+            "SELECT DISTINCT agent_id FROM audit_log WHERE timestamp >= ?",
+            (one_min_ago,),
+        ).fetchall()
+        known_agents = set(_agents.keys())
+        for row in rows:
+            agent_id = row[0]
+            if agent_id not in known_agents and agent_id != "admin":
+                import asyncio
+                try:
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(
+                        panic_mgr.auto_panic(
+                            f"Unknown agent detected: '{agent_id}'"
+                        )
+                    )
+                    loop.close()
+                except Exception as e:
+                    logger.error("Auto-panic (unknown agent) failed: %s", e)
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -1227,6 +1526,10 @@ async def execute_proxy(
     start = time.monotonic()
     client_ip = request.client.host if request.client else "unknown"
 
+    # --- Phase 10: Gate lock check (FIRST — before anything else) ---
+    if panic_mgr:
+        panic_mgr.check_gate()
+
     # --- Check proxy is enabled ---
     if not proxy_exec or not proxy_exec.enabled:
         raise HTTPException(status_code=404, detail="Proxy is not enabled")
@@ -1242,6 +1545,9 @@ async def execute_proxy(
             response_time_ms=_elapsed_ms(start),
         )
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # --- Phase 10: Agent identity hardening ---
+    _validate_agent_identity(request, req.agent_id)
 
     # --- Look up proxy action ---
     action = proxy_exec.get_action(req.action_name)
@@ -1475,6 +1781,10 @@ async def request_credential(
     start = time.monotonic()
     client_ip = request.client.host if request.client else "unknown"
 
+    # --- Phase 10: Gate lock check (FIRST — before anything else) ---
+    if panic_mgr:
+        panic_mgr.check_gate()
+
     # --- Authenticate agent ---
     if not _validate_api_key(req.agent_id, x_api_key):
         audit_log.log(
@@ -1487,6 +1797,9 @@ async def request_credential(
             response_time_ms=_elapsed_ms(start),
         )
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # --- Phase 10: Agent identity hardening ---
+    _validate_agent_identity(request, req.agent_id)
 
     # --- Authorize credential access ---
     if not _is_credential_allowed(req.agent_id, req.credential_name):

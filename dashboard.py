@@ -41,6 +41,21 @@ a{color:var(--blue);text-decoration:none}
 .card .trend{font-size:12px;color:var(--fg2)}
 .card .trend.up{color:var(--green)}.card .trend.down{color:var(--red)}
 
+/* Lock banner */
+.lock-banner{background:#f8514944;border:2px solid var(--red);border-radius:8px;padding:16px 20px;margin-bottom:16px;display:none;text-align:center}
+.lock-banner.visible{display:block}
+.lock-banner h2{color:var(--red);font-size:18px;margin-bottom:8px}
+.lock-banner .lock-details{font-size:13px;color:var(--fg);margin-bottom:12px}
+.lock-banner .lock-duration{font-size:12px;color:var(--fg2)}
+
+/* Panic / Unlock buttons */
+.panic-controls{display:flex;gap:12px;justify-content:center;margin-bottom:16px}
+.btn-panic{background:var(--red);color:#fff;border:none;padding:10px 24px;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;font-family:var(--font);text-transform:uppercase;letter-spacing:1px}
+.btn-panic:hover{opacity:0.85}
+.btn-unlock{background:var(--green);color:#fff;border:none;padding:10px 24px;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;font-family:var(--font);text-transform:uppercase;letter-spacing:1px;display:none}
+.btn-unlock:hover{opacity:0.85}
+.btn-unlock.visible{display:inline-block}
+
 /* Anomaly banner */
 .anomaly-banner{background:#f8514922;border:1px solid var(--red);border-radius:8px;padding:12px 16px;margin-bottom:16px;display:none}
 .anomaly-banner.visible{display:block}
@@ -97,6 +112,19 @@ tr.info td{border-left:3px solid var(--blue)}
   <div class="status-item" style="color:var(--fg2);font-size:11px" id="last-update"></div>
 </div>
 
+<!-- Lock Banner (Phase 10) -->
+<div class="lock-banner" id="lock-banner">
+  <h2>GATE LOCKED</h2>
+  <div class="lock-details" id="lock-details"></div>
+  <div class="lock-duration" id="lock-duration"></div>
+</div>
+
+<!-- Panic / Unlock Controls (Phase 10) -->
+<div class="panic-controls">
+  <button class="btn-panic" id="btn-panic" onclick="triggerPanic()">PANIC LOCK</button>
+  <button class="btn-unlock" id="btn-unlock" onclick="triggerUnlock()">UNLOCK GATE</button>
+</div>
+
 <!-- Live Counters -->
 <div class="cards">
   <div class="card"><div class="label">Requests (24h)</div><div class="value" id="c-requests">—</div><div class="trend" id="c-requests-trend"></div></div>
@@ -129,7 +157,7 @@ tr.info td{border-left:3px solid var(--blue)}
   <tbody id="leases-body"></tbody></table>
 </div>
 
-<div class="footer">Credential Gate &mdash; Phase 8 Observability</div>
+<div class="footer">Credential Gate &mdash; Phase 10</div>
 
 </div>
 
@@ -170,20 +198,23 @@ function statusDot(id, color, text) {
 }
 
 function rowClass(status) {
-  if (status === "approved" || status === "proxy_executed") return "approved";
-  if (status === "denied" || status === "proxy_failed") return "denied";
+  if (status === "approved" || status === "proxy_executed" || status === "panic_unlocked") return "approved";
+  if (status === "denied" || status === "proxy_failed" || status === "panic_locked") return "denied";
   if (status === "timeout") return "timeout";
   if (status === "error") return "error";
   return "info";
 }
 
 function actionLabel(status, purpose) {
+  if (status === "panic_locked") return "PANIC LOCK";
+  if (status === "panic_unlocked") return "UNLOCK";
   if (status === "lease_renewed") return "Lease Renew";
   if (status === "lease_revoked") return "Lease Revoke";
   if (status === "lease_expired") return "Lease Expired";
   if (status === "lease_revoke_all") return "Revoke All";
   if (status === "proxy_executed" || status === "proxy_failed") return "Proxy";
   if (purpose && purpose.startsWith("proxy:")) return "Proxy";
+  if (purpose && purpose.startsWith("identity_violation")) return "Identity";
   return "Credential";
 }
 
@@ -213,6 +244,26 @@ async function refresh() {
     statusDot("proxy", health.proxy === "enabled" ? "green" : "yellow", "Proxy: " + health.proxy);
     const obs = health.observability;
     statusDot("obs", obs === "enabled" ? "green" : "yellow", "Obs: " + (obs || "unknown"));
+
+    // Lock banner (Phase 10)
+    const panic = health.panic || {};
+    const lockBanner = document.getElementById("lock-banner");
+    const btnPanic = document.getElementById("btn-panic");
+    const btnUnlock = document.getElementById("btn-unlock");
+    if (panic.locked) {
+      lockBanner.classList.add("visible");
+      document.getElementById("lock-details").textContent = "Reason: " + (panic.reason || "unknown");
+      const dur = panic.locked_for_seconds || 0;
+      const durMin = Math.floor(dur / 60);
+      const durSec = dur % 60;
+      document.getElementById("lock-duration").textContent = "Locked for " + durMin + "m " + durSec + "s";
+      btnPanic.style.display = "none";
+      btnUnlock.classList.add("visible");
+    } else {
+      lockBanner.classList.remove("visible");
+      btnPanic.style.display = "";
+      btnUnlock.classList.remove("visible");
+    }
   }
   document.getElementById("last-update").textContent = "Updated " + new Date().toLocaleTimeString();
 
@@ -325,6 +376,46 @@ async function revokeLease(leaseId) {
     if (r.ok) { refresh(); }
     else { alert("Revoke failed: " + r.status); }
   } catch (e) { alert("Revoke error: " + e); }
+}
+
+async function triggerPanic() {
+  const reason = prompt("Panic reason (required):");
+  if (!reason) return;
+  if (!confirm("LOCK THE GATE? This will revoke ALL leases and block ALL credential requests.\\n\\nYou will need to touch your YubiKey.")) return;
+  try {
+    const r = await fetch(BASE + "/panic", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({"reason": reason})
+    });
+    const data = await r.json();
+    if (r.ok) {
+      alert("Gate LOCKED. Leases revoked: " + (data.leases_revoked || 0));
+      refresh();
+    } else {
+      alert("Panic failed: " + (data.detail || r.status));
+    }
+  } catch (e) { alert("Panic error: " + e); }
+}
+
+async function triggerUnlock() {
+  const reason = prompt("Unlock reason (required):");
+  if (!reason) return;
+  if (!confirm("UNLOCK the gate? You will need to touch your YubiKey.")) return;
+  try {
+    const r = await fetch(BASE + "/unlock", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({"reason": reason})
+    });
+    const data = await r.json();
+    if (r.ok) {
+      alert("Gate UNLOCKED. Was locked for " + (data.was_locked_for_seconds || 0) + "s.");
+      refresh();
+    } else {
+      alert("Unlock failed: " + (data.detail || r.status));
+    }
+  } catch (e) { alert("Unlock error: " + e); }
 }
 
 // Initial load + 10s interval

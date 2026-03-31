@@ -606,6 +606,158 @@ def send_vault_complete_notification(
         return False
 
 
+def send_panic_notification(
+    reason: str,
+    leases_revoked: int,
+    config: dict,
+) -> bool:
+    """URGENT panic notification. Priority: max (5). Tags: rotating_light, lock, warning.
+
+    Title: 'CREDENTIAL GATE LOCKED'
+    Body: Reason, leases revoked, instructions to unlock.
+    Never raises.
+    """
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        message = (
+            f"EMERGENCY LOCKDOWN\n"
+            f"Reason: {reason}\n"
+            f"Leases revoked: {leases_revoked}\n"
+            f"\nAll credential requests are blocked.\n"
+            f"Touch YubiKey + POST /unlock to restore access."
+        )
+
+        headers = {
+            "Title": "CREDENTIAL GATE LOCKED",
+            "Priority": "max",
+            "Tags": "rotating_light,lock,warning",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Panic notification sent")
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for panic notification", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send panic notification: %s", e)
+        return False
+
+
+def send_unlock_notification(
+    reason: str,
+    locked_duration_seconds: int,
+    config: dict,
+) -> bool:
+    """Gate unlocked notification. Priority: high (4). Tags: unlock, white_check_mark.
+
+    Title: 'Credential Gate Unlocked'
+    Body: Reason, how long it was locked.
+    Never raises.
+    """
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        minutes = locked_duration_seconds // 60
+        seconds = locked_duration_seconds % 60
+        duration = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
+        message = (
+            f"Gate unlocked after {duration}\n"
+            f"Reason: {reason}\n"
+            f"\nNormal operations resumed."
+        )
+
+        headers = {
+            "Title": "Credential Gate Unlocked",
+            "Priority": "high",
+            "Tags": "unlock,white_check_mark",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Unlock notification sent")
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for unlock notification", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send unlock notification: %s", e)
+        return False
+
+
+def send_identity_violation_notification(
+    agent_id: str,
+    violation: str,
+    source_ip: str,
+    config: dict,
+) -> bool:
+    """Identity violation alert. Priority: urgent (5). Tags: warning, detective.
+
+    Title: 'Identity Violation -- {agent_id}'
+    Body: What happened, source IP, action taken.
+    Never raises.
+    """
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        message = (
+            f"Agent: {agent_id}\n"
+            f"Violation: {violation}\n"
+            f"Source IP: {source_ip}\n"
+            f"\nRequest was DENIED."
+        )
+
+        headers = {
+            "Title": f"Identity Violation \u2014 {agent_id}",
+            "Priority": "urgent",
+            "Tags": "warning,detective",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Identity violation notification sent for '%s'", agent_id)
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for identity violation", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send identity violation notification: %s", e)
+        return False
+
+
 def test_ntfy(config: dict) -> bool:
     """Send a test notification to verify Ntfy connectivity.
 
