@@ -13,6 +13,12 @@ their native MCP tool protocol via Streamable HTTP at /mcp.
 
 Phase 7: Execution proxy — agents describe actions and the gate executes
 them with credentials injected.  The agent never sees raw credentials.
+
+Phase 8: Observability — metrics collection, web dashboard, anomaly
+detection, and daily digest notifications.
+
+Phase 9: Secret discovery — scan codebases for hardcoded secrets,
+vault them in Bitwarden, track credential ages, and one-click rotation.
 """
 
 import logging
@@ -32,15 +38,20 @@ from fido import AssertionResult, assert_touch
 from leases import LeaseManager, LeaseState, _ts_to_iso
 from proxy import ProxyExecutor, ProxyResult, sanitize_output
 from notifications import (
+    send_anomaly_notification,
     send_approval_notification,
     send_approved_notification,
     send_auto_approve_notification,
+    send_daily_digest_notification,
     send_lease_expired_notification,
     send_lease_revoked_notification,
     send_revoke_all_notification,
+    send_rotation_complete_notification,
     send_rotation_failed_notification,
+    send_scan_complete_notification,
     send_timeout_notification,
     send_touch_notification,
+    send_vault_complete_notification,
 )
 from policy import LeasePolicy, load_agent_policy
 
@@ -65,6 +76,20 @@ approval_queue = ApprovalQueue()
 lease_mgr: LeaseManager | None = None
 proxy_exec: ProxyExecutor | None = None
 _expiry_stop = threading.Event()  # signal the expiry daemon to stop
+_start_time = time.time()  # service start time for uptime tracking
+
+# Phase 8: Observability
+metrics_collector = None  # type: ignore
+digest_gen = None  # type: ignore
+_last_anomalies: list[dict] = []  # most recent anomaly check results
+
+# Phase 9: Discovery & Rotation
+secret_scanner = None  # type: ignore
+credential_rotator = None  # type: ignore
+auto_vaulter = None  # type: ignore
+_last_scan_findings: list = []  # in-memory only, cleared after 10 min
+_last_scan_time: float = 0  # monotonic timestamp of last scan
+_SCAN_CACHE_TTL = 600  # 10 minutes
 
 
 @asynccontextmanager
@@ -108,6 +133,45 @@ async def lifespan(app: FastAPI):
     if proxy_exec.enabled:
         logger.info("Proxy executor enabled with %d action(s)", len(proxy_exec.list_actions()))
 
+    # Initialize observability (Phase 8)
+    global metrics_collector, digest_gen
+    obs_cfg = cfg.get("observability", {})
+    if obs_cfg.get("enabled", False):
+        from metrics import MetricsCollector
+        from digest import DigestGenerator
+
+        metrics_collector = MetricsCollector(
+            audit_db_path=cfg["audit"]["db_path"],
+            lease_db_path=str(Path(cfg["audit"]["db_path"]).parent / "leases.db"),
+        )
+
+        digest_gen = DigestGenerator(metrics_collector, cfg)
+        logger.info("Observability enabled (metrics, dashboard, anomaly detection)")
+
+        # Start daily digest scheduler
+        digest_cfg = obs_cfg.get("daily_digest", {})
+        if digest_cfg.get("enabled", False):
+            _start_digest_scheduler(digest_cfg.get("time", "23:00"))
+    else:
+        logger.info("Observability disabled (set observability.enabled: true to enable)")
+
+    # Initialize discovery & rotation (Phase 9)
+    global secret_scanner, credential_rotator, auto_vaulter
+    disc_cfg = cfg.get("discovery", {})
+    rot_cfg = cfg.get("rotation", {})
+    if disc_cfg.get("enabled", False):
+        from discovery import SecretScanner
+        secret_scanner = SecretScanner(cfg)
+        logger.info("Secret scanner enabled")
+    if rot_cfg.get("enabled", False):
+        from rotation import CredentialRotator
+        credential_rotator = CredentialRotator(bw, cfg)
+        logger.info("Credential rotator enabled")
+    if disc_cfg.get("enabled", False) or rot_cfg.get("enabled", False):
+        from vaulting import AutoVaulter
+        auto_vaulter = AutoVaulter(bw)
+        logger.info("Auto-vaulter enabled")
+
     # Mount MCP server if enabled
     mcp_cfg = cfg.get("mcp", {})
     if mcp_cfg.get("enabled", False):
@@ -120,6 +184,10 @@ async def lifespan(app: FastAPI):
             lease_manager=lease_mgr,
             audit_log=audit_log,
             proxy_executor=proxy_exec,
+            metrics_collector=metrics_collector,
+            secret_scanner=secret_scanner,
+            credential_rotator=credential_rotator,
+            auto_vaulter=auto_vaulter,
         )
         mcp_app = mcp_srv.streamable_http_app()
         mcp_path = mcp_cfg.get("path", "/mcp")
@@ -146,6 +214,8 @@ async def lifespan(app: FastAPI):
         await app.state.mcp_session_ctx.__aexit__(None, None, None)
 
     _expiry_stop.set()
+    if metrics_collector:
+        metrics_collector.close()
     bw.shutdown()
     lease_mgr.close()
     audit_log.close()
@@ -286,6 +356,16 @@ async def health():
         proxy_status = "enabled"
         proxy_action_count = len(proxy_exec.list_actions())
 
+    # Observability status
+    obs_cfg = cfg.get("observability", {})
+    obs_status = "enabled" if obs_cfg.get("enabled", False) and metrics_collector else "disabled"
+
+    # Discovery & Rotation status (Phase 9)
+    disc_cfg = cfg.get("discovery", {})
+    rot_cfg = cfg.get("rotation", {})
+    discovery_status = "enabled" if disc_cfg.get("enabled", False) and secret_scanner else "disabled"
+    rotation_status = "enabled" if rot_cfg.get("enabled", False) and credential_rotator else "disabled"
+
     return {
         "status": "ok" if bw_status == "active" else "degraded",
         "bitwarden": bw_status,
@@ -296,6 +376,9 @@ async def health():
         "proxy": proxy_status,
         "proxy_actions": proxy_action_count,
         "leases": lease_stats,
+        "observability": obs_status,
+        "discovery": discovery_status,
+        "rotation": rotation_status,
     }
 
 
@@ -315,6 +398,425 @@ async def get_audit(
     if not valid:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return audit_log.recent(limit)
+
+
+# ---------------------------------------------------------------------------
+# Observability endpoints (Phase 8)
+# ---------------------------------------------------------------------------
+
+@app.get("/stats")
+async def get_stats(hours: int = Query(24, ge=1, le=720)):
+    """Return aggregate metrics for the given time window."""
+    if not metrics_collector:
+        raise HTTPException(status_code=404, detail="Observability not enabled")
+
+    stats = metrics_collector.get_stats(hours=hours)
+
+    # Include current anomalies
+    obs_cfg = cfg.get("observability", {})
+    thresholds = obs_cfg.get("anomaly_thresholds", {})
+    if thresholds:
+        stats["anomalies"] = metrics_collector.check_anomalies(thresholds)
+    else:
+        stats["anomalies"] = []
+
+    return stats
+
+
+@app.get("/stats/{agent_id}")
+async def get_agent_stats(agent_id: str, hours: int = Query(24, ge=1, le=720)):
+    """Return agent-specific activity metrics."""
+    if not metrics_collector:
+        raise HTTPException(status_code=404, detail="Observability not enabled")
+    return metrics_collector.get_agent_activity(agent_id, hours=hours)
+
+
+@app.get("/dashboard")
+async def get_dashboard():
+    """Serve the observability dashboard HTML page."""
+    obs_cfg = cfg.get("observability", {})
+    if not obs_cfg.get("enabled", False):
+        raise HTTPException(status_code=404, detail="Dashboard not enabled")
+
+    from dashboard import get_dashboard_html
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=get_dashboard_html())
+
+
+@app.get("/events")
+async def get_events(
+    limit: int = Query(50, ge=1, le=500),
+    agent_id: str | None = Query(None),
+):
+    """Return recent audit events for dashboard polling."""
+    if not metrics_collector:
+        raise HTTPException(status_code=404, detail="Observability not enabled")
+    return metrics_collector.get_recent_events(limit=limit, agent_id=agent_id)
+
+
+@app.get("/leases/active")
+async def get_active_leases_unauthenticated():
+    """Return active leases for the dashboard (localhost-only, no auth).
+
+    This is safe because the service only binds to 127.0.0.1.
+    """
+    if not lease_mgr:
+        return []
+    leases = lease_mgr.get_active_leases()
+    return [l.to_dict() for l in leases]
+
+
+class DashboardRevokeRequest(BaseModel):
+    reason: str = "dashboard revoke"
+
+
+@app.post("/dashboard/revoke/{lease_id}")
+async def dashboard_revoke_lease(lease_id: str, body: DashboardRevokeRequest | None = None):
+    """Revoke a lease from the dashboard (localhost-only, no API key).
+
+    This is safe because the service only binds to 127.0.0.1.
+    Similar to /approve and /deny callbacks which are also unauthenticated.
+    """
+    if not lease_mgr:
+        raise HTTPException(status_code=503, detail="Lease manager not available")
+
+    lease = lease_mgr.get_lease(lease_id)
+    if not lease:
+        raise HTTPException(status_code=404, detail="Lease not found")
+
+    reason = body.reason if body else "dashboard revoke"
+    revoked = lease_mgr.revoke_lease(lease_id, reason=reason)
+    if not revoked:
+        raise HTTPException(status_code=409, detail=f"Lease is not active (state: {lease.state.value})")
+
+    audit_log.log(
+        agent_id=lease.agent_id,
+        credential_name=lease.credential_name,
+        status="lease_revoked",
+        purpose=f"lease:{lease_id[:12]} reason:{reason}",
+    )
+
+    if _notifications_enabled():
+        send_lease_revoked_notification(
+            config=cfg,
+            agent_id=lease.agent_id,
+            credential_name=lease.credential_name,
+            lease_id=lease.lease_id,
+            reason=reason,
+        )
+
+    return {"status": "revoked", "lease_id": lease_id}
+
+
+# ---------------------------------------------------------------------------
+# Discovery & Rotation endpoints (Phase 9)
+# ---------------------------------------------------------------------------
+
+class ScanRequest(BaseModel):
+    path: str
+    recursive: bool = True
+    severity_filter: str = "medium"
+
+
+class ScanResponse(BaseModel):
+    files_scanned: int
+    findings_count: int
+    by_severity: dict
+    findings: list[dict]
+
+
+@app.post("/scan", response_model=ScanResponse)
+async def scan_for_secrets(req: ScanRequest, request: Request):
+    """Scan a directory for hardcoded secrets.
+
+    Requires YubiKey approval (scan results are sensitive).
+    The response NEVER includes raw secret values — only masked versions.
+    """
+    global _last_scan_findings, _last_scan_time
+
+    if not secret_scanner:
+        raise HTTPException(status_code=404, detail="Discovery not enabled")
+
+    # Always require YubiKey for scans
+    logger.info("Secret scan requested for '%s' — awaiting YubiKey touch", req.path)
+    print(
+        f"\n{'='*60}\n"
+        f"  SECRET SCAN REQUEST\n"
+        f"  Path:      {req.path}\n"
+        f"  Recursive: {req.recursive}\n"
+        f"{'='*60}\n"
+        f"  >>> Touch your YubiKey to approve\n"
+    )
+
+    result = _run_fido2_assertion()
+    if not result.success:
+        audit_log.log(
+            agent_id="admin",
+            credential_name="secret_scan",
+            status="denied",
+            purpose=f"scan:{req.path}",
+        )
+        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+
+    # Run the scan
+    findings, files_scanned = secret_scanner.scan_directory(
+        req.path,
+        recursive=req.recursive,
+        severity_filter=req.severity_filter,
+    )
+
+    # Cache findings in memory (for vault-finding/vault-batch)
+    _last_scan_findings = findings
+    _last_scan_time = time.monotonic()
+
+    report = secret_scanner.generate_report(findings, req.path, files_scanned)
+
+    # Audit
+    audit_log.log(
+        agent_id="admin",
+        credential_name="secret_scan",
+        status="scan_completed",
+        purpose=f"scan:{req.path} findings:{len(findings)}",
+    )
+
+    if _notifications_enabled():
+        send_scan_complete_notification(
+            config=cfg,
+            scan_path=req.path,
+            total_findings=len(findings),
+            by_severity=report.get("by_severity", {}),
+        )
+
+    logger.info("Scan complete: %d files scanned, %d findings", files_scanned, len(findings))
+
+    return ScanResponse(
+        files_scanned=files_scanned,
+        findings_count=len(findings),
+        by_severity=report.get("by_severity", {}),
+        findings=report.get("findings", []),
+    )
+
+
+class VaultRequest(BaseModel):
+    finding_index: int
+    collection_id: str | None = None
+    custom_name: str | None = None
+
+
+@app.post("/vault-finding")
+async def vault_finding(req: VaultRequest, request: Request):
+    """Vault a specific finding from the most recent scan.
+
+    Requires YubiKey or phone approval.
+    """
+    if not auto_vaulter:
+        raise HTTPException(status_code=404, detail="Discovery not enabled")
+
+    # Check scan cache validity
+    if not _last_scan_findings or (time.monotonic() - _last_scan_time > _SCAN_CACHE_TTL):
+        raise HTTPException(
+            status_code=409,
+            detail="No recent scan results. Run POST /scan first.",
+        )
+
+    if req.finding_index < 0 or req.finding_index >= len(_last_scan_findings):
+        raise HTTPException(
+            status_code=400,
+            detail=f"finding_index {req.finding_index} out of range (0-{len(_last_scan_findings) - 1})",
+        )
+
+    # Require approval
+    mode = _auth_mode()
+    logger.info("Vault-finding requested — awaiting approval (mode=%s)", mode)
+    print(
+        f"\n{'='*60}\n"
+        f"  VAULT FINDING\n"
+        f"  Finding:   #{req.finding_index}\n"
+        f"  Mode:      {mode}\n"
+        f"{'='*60}\n"
+        f"  >>> Touch your YubiKey to approve\n"
+    )
+
+    result = _run_fido2_assertion()
+    if not result.success:
+        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+
+    finding = _last_scan_findings[req.finding_index]
+    vault_result = await auto_vaulter.vault_finding(
+        finding,
+        collection_id=req.collection_id,
+        custom_name=req.custom_name,
+    )
+
+    # Generate replacement instructions
+    item_name = req.custom_name or finding.suggested_bw_name
+    from vaulting import AutoVaulter
+    vault_result["replacement_instructions"] = AutoVaulter.generate_replacement_instructions(
+        finding, item_name,
+    )
+
+    audit_log.log(
+        agent_id="admin",
+        credential_name="vault_finding",
+        status="vault_" + vault_result.get("status", "unknown"),
+        purpose=f"vault:{item_name} from {finding.file_path}:{finding.line_number}",
+    )
+
+    return vault_result
+
+
+class VaultBatchRequest(BaseModel):
+    severity_filter: str = "high"
+    collection_id: str | None = None
+
+
+@app.post("/vault-batch")
+async def vault_batch(req: VaultBatchRequest, request: Request):
+    """Vault all findings from the last scan above a severity threshold.
+
+    Requires YubiKey approval (batch operation on secrets).
+    """
+    if not auto_vaulter:
+        raise HTTPException(status_code=404, detail="Discovery not enabled")
+
+    # Check scan cache
+    if not _last_scan_findings or (time.monotonic() - _last_scan_time > _SCAN_CACHE_TTL):
+        raise HTTPException(
+            status_code=409,
+            detail="No recent scan results. Run POST /scan first.",
+        )
+
+    severity_order = {"critical": 3, "high": 2, "medium": 1}
+    min_severity = severity_order.get(req.severity_filter, 2)
+    eligible = [
+        f for f in _last_scan_findings
+        if severity_order.get(f.severity, 0) >= min_severity
+    ]
+
+    if not eligible:
+        return {"total": 0, "created": 0, "skipped": 0, "failed": 0, "results": []}
+
+    # YubiKey required for batch operations
+    logger.info("Vault-batch requested (%d findings) — awaiting YubiKey touch", len(eligible))
+    print(
+        f"\n{'='*60}\n"
+        f"  VAULT BATCH\n"
+        f"  Findings:  {len(eligible)} (>= {req.severity_filter})\n"
+        f"{'='*60}\n"
+        f"  >>> Touch your YubiKey to approve\n"
+    )
+
+    result = _run_fido2_assertion()
+    if not result.success:
+        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+
+    batch_result = await auto_vaulter.vault_batch(eligible, collection_id=req.collection_id)
+
+    audit_log.log(
+        agent_id="admin",
+        credential_name="vault_batch",
+        status="vault_batch_completed",
+        purpose=f"vault_batch: {batch_result['created']} created, {batch_result['skipped']} skipped, {batch_result['failed']} failed",
+    )
+
+    if _notifications_enabled():
+        from notifications import send_vault_complete_notification
+        send_vault_complete_notification(
+            config=cfg,
+            created=batch_result["created"],
+            skipped=batch_result["skipped"],
+            failed=batch_result["failed"],
+        )
+
+    return batch_result
+
+
+@app.get("/credential-ages")
+async def get_credential_ages():
+    """Return age information for all managed credentials.
+
+    No approval needed — no secrets are exposed.
+    """
+    if not credential_rotator:
+        raise HTTPException(status_code=404, detail="Rotation not enabled")
+
+    return credential_rotator.get_all_credential_ages()
+
+
+@app.post("/rotate/{credential_name}")
+async def rotate_credential(credential_name: str, request: Request):
+    """Trigger rotation for a specific credential.
+
+    Requires YubiKey approval.
+    """
+    if not credential_rotator:
+        raise HTTPException(status_code=404, detail="Rotation not enabled")
+
+    # Determine credential type from pattern (best guess from name)
+    credential_type = _guess_credential_type(credential_name)
+
+    logger.info("Rotation requested for '%s' (type=%s) — awaiting YubiKey touch", credential_name, credential_type)
+    print(
+        f"\n{'='*60}\n"
+        f"  CREDENTIAL ROTATION\n"
+        f"  Credential: {credential_name}\n"
+        f"  Type:       {credential_type}\n"
+        f"{'='*60}\n"
+        f"  >>> Touch your YubiKey to approve\n"
+    )
+
+    result = _run_fido2_assertion()
+    if not result.success:
+        audit_log.log(
+            agent_id="admin",
+            credential_name=credential_name,
+            status="denied",
+            purpose=f"rotate:{credential_name}",
+        )
+        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+
+    rotation_result = await credential_rotator.rotate(credential_name, credential_type)
+
+    audit_log.log(
+        agent_id="admin",
+        credential_name=credential_name,
+        status="rotation_completed" if rotation_result.success else "rotation_failed",
+        purpose=f"rotate:{credential_name} type:{rotation_result.rotation_type}",
+    )
+
+    if _notifications_enabled():
+        send_rotation_complete_notification(
+            config=cfg,
+            credential_name=credential_name,
+            rotation_type=rotation_result.rotation_type,
+            success=rotation_result.success,
+            message_text=rotation_result.message,
+        )
+
+    return {
+        "success": rotation_result.success,
+        "credential_name": rotation_result.credential_name,
+        "rotation_type": rotation_result.rotation_type,
+        "message": rotation_result.message,
+        "old_invalidated": rotation_result.old_invalidated,
+        "bw_updated": rotation_result.bw_updated,
+        "instructions": rotation_result.instructions,
+        "error": rotation_result.error,
+    }
+
+
+def _guess_credential_type(credential_name: str) -> str:
+    """Guess the credential type from its name for rotation dispatch."""
+    name_lower = credential_name.lower()
+    if "github" in name_lower:
+        return "github_pat"
+    if "cloudflare" in name_lower or "cf-" in name_lower:
+        return "cloudflare_api_token"
+    if "slack" in name_lower:
+        return "slack_token"
+    if "aws" in name_lower:
+        return "aws_access_key"
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +878,12 @@ def _lease_expiry_daemon():
         except Exception as e:
             logger.error("Lease expiry daemon error: %s", e)
 
+        # Phase 8: Anomaly detection (piggybacks on expiry daemon cycle)
+        try:
+            _run_anomaly_check()
+        except Exception as e:
+            logger.error("Anomaly check error: %s", e)
+
         _expiry_stop.wait(30)
     logger.info("Lease expiry daemon stopped")
 
@@ -388,6 +896,92 @@ def _should_rotate(agent_id: str, credential_name: str) -> bool:
         return False
     lease_policy = agent_policy.get_lease_policy(credential_name)
     return lease_policy.rotate_on_expire
+
+
+def _run_anomaly_check():
+    """Check for anomalies using the metrics collector.
+
+    Called from the expiry daemon loop. Sends Ntfy notification if new
+    anomalies are detected.
+    """
+    global _last_anomalies
+
+    if not metrics_collector:
+        return
+
+    obs_cfg = cfg.get("observability", {})
+    if not obs_cfg.get("enabled", False):
+        return
+
+    thresholds = obs_cfg.get("anomaly_thresholds", {})
+    if not thresholds:
+        return
+
+    anomalies = metrics_collector.check_anomalies(thresholds)
+
+    if anomalies and anomalies != _last_anomalies:
+        logger.warning("Anomalies detected: %d", len(anomalies))
+        for a in anomalies:
+            logger.warning(
+                "  %s: %s %s = %s (threshold: %s)",
+                a["severity"], a["agent_id"], a["metric"],
+                a["value"], a["threshold"],
+            )
+        if _notifications_enabled():
+            send_anomaly_notification(anomalies, cfg)
+
+    _last_anomalies = anomalies
+
+
+# ---------------------------------------------------------------------------
+# Daily digest scheduler (Phase 8)
+# ---------------------------------------------------------------------------
+
+_digest_timer: threading.Timer | None = None
+
+
+def _start_digest_scheduler(time_str: str):
+    """Schedule the daily digest to run at the configured time.
+
+    Uses a threading.Timer that reschedules itself after each run.
+    """
+    global _digest_timer
+
+    try:
+        hour, minute = map(int, time_str.split(":"))
+    except (ValueError, AttributeError):
+        logger.warning("Invalid digest time '%s', defaulting to 23:00", time_str)
+        hour, minute = 23, 0
+
+    def _schedule_next():
+        import datetime as dt
+
+        now = dt.datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += dt.timedelta(days=1)
+        delay = (target - now).total_seconds()
+
+        global _digest_timer
+        _digest_timer = threading.Timer(delay, _run_digest)
+        _digest_timer.daemon = True
+        _digest_timer.start()
+        logger.info("Daily digest scheduled for %s (in %.0f seconds)", target.strftime("%H:%M"), delay)
+
+    def _run_digest():
+        if digest_gen:
+            import asyncio
+            try:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(digest_gen.send_digest())
+                loop.close()
+            except Exception as e:
+                logger.error("Daily digest failed: %s", e)
+        # Reschedule for tomorrow
+        if not _expiry_stop.is_set():
+            _schedule_next()
+
+    _schedule_next()
 
 
 # ---------------------------------------------------------------------------

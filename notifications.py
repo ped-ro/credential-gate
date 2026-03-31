@@ -386,6 +386,226 @@ def send_rotation_failed_notification(
         return False
 
 
+def send_anomaly_notification(anomalies: list[dict], config: dict) -> bool:
+    """Send high-priority Ntfy notification for detected anomalies.
+
+    Priority: urgent (5). Tags: warning, rotating_light.
+    Never raises — all errors are logged and swallowed.
+    """
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        lines = [f"{len(anomalies)} anomaly(s) detected:"]
+        for a in anomalies:
+            lines.append(
+                f"  {a['severity'].upper()}: {a['agent_id']} — "
+                f"{a['metric']} = {a['value']} (threshold: {a['threshold']})"
+            )
+        message = "\n".join(lines)
+
+        headers = {
+            "Title": "Credential Gate — Anomaly Alert",
+            "Priority": "urgent",
+            "Tags": "warning,rotating_light",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Anomaly notification sent (%d anomalies)", len(anomalies))
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for anomaly notification", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send anomaly notification: %s", e)
+        return False
+
+
+def send_daily_digest_notification(digest_text: str, config: dict) -> bool:
+    """Send daily digest via Ntfy.
+
+    Priority: default (3). Tags: bar_chart.
+    Never raises — all errors are logged and swallowed.
+    """
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        headers = {
+            "Title": "Credential Gate — Daily Digest",
+            "Priority": "default",
+            "Tags": "bar_chart",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = digest_text.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status < 300:
+                logger.info("Daily digest notification sent")
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for digest", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send daily digest notification: %s", e)
+        return False
+
+
+def send_scan_complete_notification(
+    config: dict,
+    scan_path: str,
+    total_findings: int,
+    by_severity: dict,
+) -> bool:
+    """Notify that a secret scan completed. Never raises."""
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        severity_text = ", ".join(f"{k}: {v}" for k, v in sorted(by_severity.items()))
+        message = (
+            f"Secret scan completed: {scan_path}\n"
+            f"Findings: {total_findings} ({severity_text})"
+        )
+
+        priority = "urgent" if by_severity.get("critical", 0) > 0 else "default"
+        headers = {
+            "Title": "Credential Gate — Secret Scan Complete",
+            "Priority": priority,
+            "Tags": "mag",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Scan complete notification sent (%d findings)", total_findings)
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for scan notification", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send scan notification: %s", e)
+        return False
+
+
+def send_rotation_complete_notification(
+    config: dict,
+    credential_name: str,
+    rotation_type: str,
+    success: bool,
+    message_text: str,
+) -> bool:
+    """Notify that a credential rotation completed (or failed). Never raises."""
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        status = "succeeded" if success else "failed"
+        message = (
+            f"Credential rotation {status}: '{credential_name}'\n"
+            f"Type: {rotation_type}\n"
+            f"{message_text}"
+        )
+
+        priority = "default" if success else "urgent"
+        tag = "white_check_mark" if success else "warning"
+        headers = {
+            "Title": f"Credential Gate — Rotation {'Complete' if success else 'Failed'}",
+            "Priority": priority,
+            "Tags": tag,
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Rotation notification sent for '%s'", credential_name)
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for rotation notification", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send rotation notification: %s", e)
+        return False
+
+
+def send_vault_complete_notification(
+    config: dict,
+    created: int,
+    skipped: int,
+    failed: int,
+) -> bool:
+    """Notify that auto-vaulting completed. Never raises."""
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        message = (
+            f"Auto-vaulting complete:\n"
+            f"  Created: {created}\n"
+            f"  Skipped: {skipped}\n"
+            f"  Failed: {failed}"
+        )
+
+        headers = {
+            "Title": "Credential Gate — Secrets Vaulted",
+            "Priority": "default",
+            "Tags": "lock",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Vault complete notification sent")
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for vault notification", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send vault notification: %s", e)
+        return False
+
+
 def test_ntfy(config: dict) -> bool:
     """Send a test notification to verify Ntfy connectivity.
 

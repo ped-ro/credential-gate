@@ -89,5 +89,50 @@ proxy:
       timeout_seconds: 15
       max_response_bytes: 524288      # 512 KB
 
+observability:
+  enabled: true
+  anomaly_thresholds:
+    default:
+      max_requests_per_hour: 30
+      max_requests_per_day: 200
+      max_unique_credentials_per_hour: 10
+      max_denials_per_hour: 5
+    # Per-agent overrides:
+    # my-agent:
+    #   max_requests_per_hour: 20
+    #   max_requests_per_day: 100
+  daily_digest:
+    enabled: true
+    time: "23:00"       # local time, 24h format
+  dashboard:
+    enabled: true
+    path: "/dashboard"
+
+discovery:
+  enabled: true
+  # Additional regex patterns (beyond built-in)
+  custom_patterns: []
+  # Paths to always exclude from scans
+  exclude_paths:
+    - "*/node_modules/*"
+    - "*/.git/*"
+    - "*/venv/*"
+
+rotation:
+  enabled: true
+  # Age thresholds in days
+  stale_threshold_days: 30
+  overdue_threshold_days: 90
+  # Service-specific config for rotation
+  services:
+    github:
+      # GitHub doesn't support PAT creation via API
+      # Scanner will report age + link to create new token
+      token_settings_url: "https://github.com/settings/tokens?type=beta"
+    cloudflare:
+      # Cloudflare API token rotation is fully automatic
+      # Requires: current token has "API Tokens: Edit" permission
+      api_url: "https://api.cloudflare.com/client/v4"
+
 audit:
   db_path: "data/audit.db"

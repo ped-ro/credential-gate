@@ -27,6 +27,10 @@ def create_mcp_server(
     lease_manager,
     audit_log,
     proxy_executor=None,
+    metrics_collector=None,
+    secret_scanner=None,
+    credential_rotator=None,
+    auto_vaulter=None,
 ) -> FastMCP:
     """Create and configure the MCP server with all tools.
 
@@ -435,6 +439,34 @@ def create_mcp_server(
             proxy_status = "enabled"
             proxy_action_count = len(proxy_executor.list_actions())
 
+        # Observability summary (Phase 8)
+        obs_summary = {}
+        if metrics_collector:
+            try:
+                stats = metrics_collector.get_stats(hours=1)
+                obs_summary["requests_last_hour"] = stats.get("requests", {}).get("total", 0)
+                obs_summary["active_leases"] = stats.get("leases", {}).get("active", 0)
+
+                obs_cfg = config.get("observability", {})
+                thresholds = obs_cfg.get("anomaly_thresholds", {})
+                if thresholds:
+                    anomalies = metrics_collector.check_anomalies(thresholds)
+                    obs_summary["anomalies"] = len(anomalies)
+                    if anomalies:
+                        obs_summary["anomaly_details"] = anomalies
+                else:
+                    obs_summary["anomalies"] = 0
+            except Exception:
+                obs_summary["error"] = "metrics unavailable"
+
+        obs_status = "enabled" if metrics_collector else "disabled"
+
+        # Discovery & Rotation status (Phase 9)
+        disc_cfg = config.get("discovery", {})
+        rot_cfg = config.get("rotation", {})
+        discovery_status = "enabled" if disc_cfg.get("enabled", False) and secret_scanner else "disabled"
+        rotation_status = "enabled" if rot_cfg.get("enabled", False) and credential_rotator else "disabled"
+
         return json.dumps({
             "status": "ok" if bw_status == "active" else "degraded",
             "bitwarden": bw_status,
@@ -445,6 +477,10 @@ def create_mcp_server(
             "proxy": proxy_status,
             "proxy_actions": proxy_action_count,
             "leases": lease_stats,
+            "observability": obs_status,
+            "metrics_summary": obs_summary,
+            "discovery": discovery_status,
+            "rotation": rotation_status,
         })
 
     @mcp.tool(
@@ -645,5 +681,187 @@ def create_mcp_server(
         )
 
         return json.dumps(result.to_dict())
+
+    @mcp.tool(
+        description=(
+            "Get Credential Gate usage statistics. Returns aggregate metrics: "
+            "request counts, approval rates, active leases, proxy executions, "
+            "agent breakdown, and any detected anomalies."
+        ),
+    )
+    async def get_gate_stats(hours: int = 24) -> str:
+        if not metrics_collector:
+            return json.dumps({
+                "status": "error",
+                "reason": "Observability not enabled",
+            })
+
+        stats = metrics_collector.get_stats(hours=hours)
+
+        # Include anomalies
+        obs_cfg = config.get("observability", {})
+        thresholds = obs_cfg.get("anomaly_thresholds", {})
+        if thresholds:
+            stats["anomalies"] = metrics_collector.check_anomalies(thresholds)
+        else:
+            stats["anomalies"] = []
+
+        return json.dumps(stats)
+
+    # -- Phase 9: Discovery & Rotation tools -------------------------------
+
+    @mcp.tool(
+        description=(
+            "Scan a directory for hardcoded secrets and credentials. "
+            "Requires YubiKey approval. Returns findings with masked values — "
+            "raw secrets are never exposed through this tool.\n\n"
+            "Args:\n"
+            "  agent_id: Your agent identifier\n"
+            "  path: Directory path to scan\n"
+            "  recursive: Scan subdirectories (default: true)\n"
+            "  severity_filter: Minimum severity to report: 'critical', 'high', or 'medium'"
+        ),
+    )
+    async def scan_for_secrets(
+        agent_id: str,
+        path: str,
+        recursive: bool = True,
+        severity_filter: str = "medium",
+    ) -> str:
+        if not secret_scanner:
+            return json.dumps({"status": "error", "reason": "Discovery not enabled"})
+
+        if agent_id not in agents:
+            return json.dumps({"status": "error", "reason": f"Unknown agent '{agent_id}'"})
+
+        # Require YubiKey approval
+        from main import _run_fido2_assertion, _print_request_banner, CredentialRequest
+
+        req = CredentialRequest(
+            agent_id=agent_id,
+            credential_name="secret_scan",
+            purpose=f"scan:{path}",
+            fields=[],
+        )
+        _print_request_banner(req, "yubikey")
+
+        result = _run_fido2_assertion()
+        if not result.success:
+            audit_log.log(
+                agent_id=agent_id,
+                credential_name="secret_scan",
+                status="denied",
+                purpose=f"scan:{path}",
+            )
+            return json.dumps({
+                "status": "denied",
+                "reason": f"YubiKey assertion failed: {result.error}",
+            })
+
+        # Run scan
+        findings, files_scanned = secret_scanner.scan_directory(
+            path, recursive=recursive, severity_filter=severity_filter,
+        )
+
+        # Cache findings in main module for vault operations
+        import main as _main
+        _main._last_scan_findings = findings
+        _main._last_scan_time = time.monotonic()
+
+        report = secret_scanner.generate_report(findings, path, files_scanned)
+
+        audit_log.log(
+            agent_id=agent_id,
+            credential_name="secret_scan",
+            status="scan_completed",
+            purpose=f"scan:{path} findings:{len(findings)} (mcp)",
+        )
+
+        return json.dumps(report)
+
+    @mcp.tool(
+        description=(
+            "Check the age of all managed credentials in Bitwarden. "
+            "Returns age, last rotation date, and status (ok/stale/overdue) "
+            "for each credential. No approval required — no secrets are exposed."
+        ),
+    )
+    async def check_credential_ages(agent_id: str) -> str:
+        if not credential_rotator:
+            return json.dumps({"status": "error", "reason": "Rotation not enabled"})
+
+        if agent_id not in agents:
+            return json.dumps({"status": "error", "reason": f"Unknown agent '{agent_id}'"})
+
+        ages = credential_rotator.get_all_credential_ages()
+        return json.dumps({"credentials": ages})
+
+    @mcp.tool(
+        description=(
+            "Rotate a credential to a new value. Requires YubiKey approval. "
+            "For services with API support (Cloudflare), rotation is automatic. "
+            "For others (GitHub PATs), returns instructions for manual rotation.\n\n"
+            "Args:\n"
+            "  agent_id: Your agent identifier\n"
+            "  credential_name: Name of the credential to rotate\n"
+            "  purpose: Why rotation is needed (for audit)"
+        ),
+    )
+    async def rotate_credential(
+        agent_id: str,
+        credential_name: str,
+        purpose: str = "",
+    ) -> str:
+        if not credential_rotator:
+            return json.dumps({"status": "error", "reason": "Rotation not enabled"})
+
+        if agent_id not in agents:
+            return json.dumps({"status": "error", "reason": f"Unknown agent '{agent_id}'"})
+
+        # Require YubiKey approval
+        from main import _run_fido2_assertion, _print_request_banner, CredentialRequest, _guess_credential_type
+
+        credential_type = _guess_credential_type(credential_name)
+
+        req = CredentialRequest(
+            agent_id=agent_id,
+            credential_name=credential_name,
+            purpose=f"rotate:{credential_name} {purpose}",
+            fields=[],
+        )
+        _print_request_banner(req, "yubikey")
+
+        result = _run_fido2_assertion()
+        if not result.success:
+            audit_log.log(
+                agent_id=agent_id,
+                credential_name=credential_name,
+                status="denied",
+                purpose=f"rotate:{credential_name} {purpose}",
+            )
+            return json.dumps({
+                "status": "denied",
+                "reason": f"YubiKey assertion failed: {result.error}",
+            })
+
+        rotation_result = await credential_rotator.rotate(credential_name, credential_type)
+
+        audit_log.log(
+            agent_id=agent_id,
+            credential_name=credential_name,
+            status="rotation_completed" if rotation_result.success else "rotation_failed",
+            purpose=f"rotate:{credential_name} type:{rotation_result.rotation_type} (mcp)",
+        )
+
+        return json.dumps({
+            "success": rotation_result.success,
+            "credential_name": rotation_result.credential_name,
+            "rotation_type": rotation_result.rotation_type,
+            "message": rotation_result.message,
+            "old_invalidated": rotation_result.old_invalidated,
+            "bw_updated": rotation_result.bw_updated,
+            "instructions": rotation_result.instructions,
+            "error": rotation_result.error,
+        })
 
     return mcp
