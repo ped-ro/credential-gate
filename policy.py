@@ -28,6 +28,49 @@ VALID_RISK_LEVELS = {"low", "medium", "high", "critical"}
 VALID_ON_EXCEED = {"deny", "deny_and_alert", "queue"}
 
 
+class LeasePolicy:
+    """Lease-specific policy settings for a credential."""
+
+    __slots__ = (
+        "lease_ttl_minutes",
+        "max_lease_minutes",
+        "max_concurrent_leases",
+        "rotate_on_expire",
+    )
+
+    def __init__(
+        self,
+        lease_ttl_minutes: int = 15,
+        max_lease_minutes: int = 60,
+        max_concurrent_leases: int = 10,
+        rotate_on_expire: bool = False,
+    ):
+        self.lease_ttl_minutes = lease_ttl_minutes
+        self.max_lease_minutes = max_lease_minutes
+        self.max_concurrent_leases = max_concurrent_leases
+        self.rotate_on_expire = rotate_on_expire
+
+    @property
+    def ttl_seconds(self) -> int:
+        return self.lease_ttl_minutes * 60
+
+    @property
+    def max_lease_seconds(self) -> int:
+        return self.max_lease_minutes * 60
+
+    def to_dict(self) -> dict:
+        return {
+            "lease_ttl_minutes": self.lease_ttl_minutes,
+            "max_lease_minutes": self.max_lease_minutes,
+            "max_concurrent_leases": self.max_concurrent_leases,
+            "rotate_on_expire": self.rotate_on_expire,
+        }
+
+
+# Default lease policy when none is specified
+_DEFAULT_LEASE_POLICY = LeasePolicy()
+
+
 class PolicyDecision:
     """Result of policy evaluation for a single credential request."""
 
@@ -39,6 +82,7 @@ class PolicyDecision:
         auto_approve_seconds: int | None = None,
         alert_always: bool = False,
         checks: list[dict] | None = None,
+        lease_policy: LeasePolicy | None = None,
     ):
         self.allowed = allowed
         self.reason = reason
@@ -46,6 +90,7 @@ class PolicyDecision:
         self.auto_approve_seconds = auto_approve_seconds
         self.alert_always = alert_always
         self.checks = checks or []
+        self.lease_policy = lease_policy or _DEFAULT_LEASE_POLICY
 
     def to_dict(self) -> dict:
         return {
@@ -55,6 +100,7 @@ class PolicyDecision:
             "auto_approve_seconds": self.auto_approve_seconds,
             "alert_always": self.alert_always,
             "checks": self.checks,
+            "lease_policy": self.lease_policy.to_dict(),
         }
 
 
@@ -76,6 +122,27 @@ class AgentPolicy:
             "risk": "medium",
             "approval": self.default_approval,
         })
+
+    def get_lease_policy(self, credential_name: str) -> LeasePolicy:
+        """Build a LeasePolicy from the credential-specific and wildcard settings."""
+        # Start with wildcard defaults
+        wildcard = self.credentials.get("*", {})
+        specific = self.credentials.get(credential_name, {})
+
+        # Merge: specific overrides wildcard
+        def _get(key, default):
+            if key in specific:
+                return specific[key]
+            if key in wildcard:
+                return wildcard[key]
+            return default
+
+        return LeasePolicy(
+            lease_ttl_minutes=_get("lease_ttl_minutes", 15),
+            max_lease_minutes=_get("max_lease_minutes", 60),
+            max_concurrent_leases=_get("max_concurrent_leases", 10),
+            rotate_on_expire=_get("rotate_on_expire", False),
+        )
 
     def check_schedule(self) -> tuple[bool, str]:
         """Check if current time is within allowed hours.
@@ -288,12 +355,14 @@ class AgentPolicy:
             )
 
         # All checks passed
+        lease_policy = self.get_lease_policy(credential_name)
         return PolicyDecision(
             allowed=True,
             approval_mode=effective_approval,
             auto_approve_seconds=cred_policy.get("auto_approve_seconds"),
             alert_always=cred_policy.get("alert_always", False),
             checks=checks,
+            lease_policy=lease_policy,
         )
 
 
@@ -437,5 +506,22 @@ def validate_policy_file(path: Path) -> list[str]:
             requires = cred_cfg.get("requires")
             if requires is not None and not isinstance(requires, list):
                 errors.append(f"Credential '{cred_name}': requires must be a list")
+
+            # Lease fields
+            lease_ttl = cred_cfg.get("lease_ttl_minutes")
+            if lease_ttl is not None and (not isinstance(lease_ttl, (int, float)) or lease_ttl < 1):
+                errors.append(f"Credential '{cred_name}': lease_ttl_minutes must be >= 1")
+
+            max_lease = cred_cfg.get("max_lease_minutes")
+            if max_lease is not None and (not isinstance(max_lease, (int, float)) or max_lease < 1):
+                errors.append(f"Credential '{cred_name}': max_lease_minutes must be >= 1")
+
+            max_concurrent = cred_cfg.get("max_concurrent_leases")
+            if max_concurrent is not None and (not isinstance(max_concurrent, int) or max_concurrent < 1):
+                errors.append(f"Credential '{cred_name}': max_concurrent_leases must be >= 1")
+
+            rotate_on_expire = cred_cfg.get("rotate_on_expire")
+            if rotate_on_expire is not None and not isinstance(rotate_on_expire, bool):
+                errors.append(f"Credential '{cred_name}': rotate_on_expire must be a boolean")
 
     return errors

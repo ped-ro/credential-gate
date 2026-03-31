@@ -180,6 +180,46 @@ class BitwardenClient:
         self._run("sync")
         logger.info("Bitwarden vault synced")
 
+    def generate_password(self, length: int = 32) -> str:
+        """Generate a random password using the Bitwarden CLI."""
+        return self._run("generate", "-ulns", f"--length={length}", session=False)
+
+    def rotate_credential(self, item_name: str, field: str = "password") -> str:
+        """Generate a new password and update a Bitwarden vault item.
+
+        Returns the new password. Only supports the login password field.
+        Raises BitwardenError on failure.
+        """
+        import base64
+
+        # 1. Generate new password
+        new_password = self.generate_password()
+
+        # 2. Get the full item
+        item = self.get_item(item_name)
+        item_id = item.get("id")
+        if not item_id:
+            raise BitwardenError(f"Cannot find item ID for '{item_name}'")
+
+        # 3. Update the password in the item JSON
+        if field == "password":
+            login = item.get("login", {})
+            if login is None:
+                login = {}
+            login["password"] = new_password
+            item["login"] = login
+        else:
+            raise BitwardenError(f"Rotation of field '{field}' is not supported (only 'password')")
+
+        # 4. Encode updated item as base64 and push to Bitwarden
+        item_json = json.dumps(item).encode()
+        item_b64 = base64.b64encode(item_json).decode()
+
+        self._run("edit", "item", item_id, item_b64)
+        logger.info("Rotated credential '%s' (field=%s)", item_name, field)
+
+        return new_password
+
 
 # ---------------------------------------------------------------------------
 # Keychain helpers (macOS `security` CLI)
@@ -484,6 +524,32 @@ class BitwardenSessionManager:
     def extract_fields(self, item: dict, requested: list[str]) -> dict:
         """Delegate to the underlying client."""
         return self._client.extract_fields(item, requested)
+
+    def rotate_credential(self, item_name: str, field: str = "password") -> str:
+        """Rotate a credential with automatic session management.
+
+        Returns the new password. Best-effort — errors are raised, caller
+        should catch and log.
+        """
+        self.ensure_unlocked()
+
+        try:
+            return self._client.rotate_credential(item_name, field)
+        except BitwardenError as e:
+            if not _is_session_error(str(e)):
+                raise
+
+            logger.warning("Session error during rotation, re-unlocking: %s", e)
+            with self._lock:
+                self._state = SessionState.EXPIRED
+                self._client._session = None
+                self._client._session_expires = 0
+                if not self._do_unlock():
+                    raise BitwardenError(
+                        "Failed to re-unlock Bitwarden after session error"
+                    )
+
+            return self._client.rotate_credential(item_name, field)
 
     def shutdown(self) -> None:
         """Clean up resources (cancel timers)."""

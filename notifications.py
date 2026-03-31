@@ -241,6 +241,151 @@ def send_approved_notification(
         return False
 
 
+def send_lease_expired_notification(
+    config: dict,
+    agent_id: str,
+    credential_name: str,
+    lease_id: str,
+    rotated: bool = False,
+) -> bool:
+    """Notify that a lease has expired. Never raises."""
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        rotation_note = " — credential rotated in Bitwarden" if rotated else ""
+        message = (
+            f"Lease expired: '{credential_name}' ({agent_id})"
+            f"\nLease: {lease_id[:12]}…{rotation_note}"
+        )
+
+        headers = {
+            "Title": "Credential Gate — Lease Expired",
+            "Priority": "default",
+            "Tags": "hourglass",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status < 300
+
+    except Exception:
+        return False
+
+
+def send_lease_revoked_notification(
+    config: dict,
+    agent_id: str,
+    credential_name: str,
+    lease_id: str,
+    reason: str = "",
+) -> bool:
+    """Notify that a lease was revoked. Never raises."""
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        reason_text = f" ({reason})" if reason else ""
+        message = (
+            f"Lease revoked: '{credential_name}' ({agent_id}){reason_text}"
+            f"\nLease: {lease_id[:12]}…"
+        )
+
+        headers = {
+            "Title": "Credential Gate — Lease Revoked",
+            "Priority": "default",
+            "Tags": "x",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status < 300
+
+    except Exception:
+        return False
+
+
+def send_revoke_all_notification(
+    config: dict,
+    count: int,
+    agent_id: str | None = None,
+) -> bool:
+    """Notify that all leases were revoked (emergency). Never raises."""
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        scope = f" for {agent_id}" if agent_id else ""
+        message = f"All active leases revoked{scope} ({count} lease(s))"
+
+        headers = {
+            "Title": "Credential Gate — All Leases Revoked",
+            "Priority": "urgent",
+            "Tags": "rotating_light",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status < 300
+
+    except Exception:
+        return False
+
+
+def send_rotation_failed_notification(
+    config: dict,
+    credential_name: str,
+    error: str,
+) -> bool:
+    """Notify that credential rotation failed. Never raises."""
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        message = f"Credential rotation failed for '{credential_name}'\nError: {error}"
+
+        headers = {
+            "Title": "Credential Gate — Rotation Failed",
+            "Priority": "urgent",
+            "Tags": "warning",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status < 300
+
+    except Exception:
+        return False
+
+
 def test_ntfy(config: dict) -> bool:
     """Send a test notification to verify Ntfy connectivity.
 

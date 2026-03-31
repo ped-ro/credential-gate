@@ -33,5 +33,14 @@ notifications:
   ntfy_token: null                         # optional, for self-hosted with auth
   callback_base_url: "http://127.0.0.1:8200"  # or Cloudflare tunnel URL for remote
 
+policies:
+  directory: "policies"
+  default_policy: "deny"  # "deny" if no policy file, or "allow_all"
+
+mcp:
+  enabled: true
+  path: "/mcp"                    # mount point on the FastAPI app
+  server_name: "credential-gate"
+
 audit:
   db_path: "data/audit.db"

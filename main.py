@@ -4,16 +4,21 @@ Physical authorization gate: AI agents request credentials, and a
 YubiKey touch, phone approval, or either-first-wins authorizes access.
 The credential is fetched fresh from Bitwarden on every approved request.
 
-Phase 4: YAML-based policy engine — schedule, rate limits, cooldowns,
-prerequisites, per-credential approval mode overrides, auto-approve timers.
+Phase 5: Credential leases — every approved request creates a lease with
+TTL, tracked in SQLite.  Leases can be renewed, revoked, and auto-expire.
+Credentials with rotate_on_expire get new passwords in Bitwarden.
+
+Phase 6: MCP server interface — agents can request credentials through
+their native MCP tool protocol via Streamable HTTP at /mcp.
 """
 
 import logging
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from approvals import ApprovalQueue, ApprovalState
@@ -21,14 +26,19 @@ from audit import AuditLog
 from bitwarden import BitwardenError, BitwardenSessionManager, SessionState
 from config import load_config
 from fido import AssertionResult, assert_touch
+from leases import LeaseManager, LeaseState, _ts_to_iso
 from notifications import (
     send_approval_notification,
     send_approved_notification,
     send_auto_approve_notification,
+    send_lease_expired_notification,
+    send_lease_revoked_notification,
+    send_revoke_all_notification,
+    send_rotation_failed_notification,
     send_timeout_notification,
     send_touch_notification,
 )
-from policy import load_agent_policy
+from policy import LeasePolicy, load_agent_policy
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -48,12 +58,18 @@ cfg = load_config()
 audit_log: AuditLog | None = None
 bw: BitwardenSessionManager | None = None
 approval_queue = ApprovalQueue()
+lease_mgr: LeaseManager | None = None
+_expiry_stop = threading.Event()  # signal the expiry daemon to stop
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global audit_log, bw
+    global audit_log, bw, lease_mgr
     audit_log = AuditLog(cfg["audit"]["db_path"])
+
+    # Lease manager — store leases alongside audit DB
+    lease_db_path = str(Path(cfg["audit"]["db_path"]).parent / "leases.db")
+    lease_mgr = LeaseManager(lease_db_path)
 
     bw_cfg = cfg.get("bitwarden", {})
     bw = BitwardenSessionManager(
@@ -76,6 +92,34 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Bitwarden session state: %s", state.value)
 
+    # Start the lease expiry daemon
+    _expiry_stop.clear()
+    expiry_thread = threading.Thread(target=_lease_expiry_daemon, daemon=True)
+    expiry_thread.start()
+
+    # Mount MCP server if enabled
+    mcp_cfg = cfg.get("mcp", {})
+    if mcp_cfg.get("enabled", False):
+        from mcp_server import create_mcp_server
+
+        mcp_srv = create_mcp_server(
+            config=cfg,
+            bw_manager=bw,
+            approval_queue=approval_queue,
+            lease_manager=lease_mgr,
+            audit_log=audit_log,
+        )
+        mcp_app = mcp_srv.streamable_http_app()
+        mcp_path = mcp_cfg.get("path", "/mcp")
+        app.mount(mcp_path, mcp_app)
+
+        # Start the MCP session manager
+        _mcp_session_ctx = mcp_srv.session_manager.run()
+        await _mcp_session_ctx.__aenter__()
+        app.state.mcp_session_ctx = _mcp_session_ctx
+
+        logger.info("MCP server mounted at %s", mcp_path)
+
     mode = cfg.get("authorization", {}).get("mode", "yubikey")
     logger.info(
         "Credential Gate started on %s:%s (mode=%s)",
@@ -84,7 +128,14 @@ async def lifespan(app: FastAPI):
         mode,
     )
     yield
+
+    # Shutdown MCP session manager
+    if hasattr(app.state, "mcp_session_ctx"):
+        await app.state.mcp_session_ctx.__aexit__(None, None, None)
+
+    _expiry_stop.set()
     bw.shutdown()
+    lease_mgr.close()
     audit_log.close()
     logger.info("Credential Gate stopped")
 
@@ -132,10 +183,16 @@ class CredentialRequest(BaseModel):
     fields: list[str] = ["password"]
 
 
+class LeaseInfo(BaseModel):
+    lease_id: str
+    expires_at: str
+    ttl_seconds: int
+    renewable: bool
+
 class CredentialResponse(BaseModel):
     status: str
     credential: dict | None = None
-    expires_at: None = None
+    lease: LeaseInfo | None = None
     reason: str | None = None
 
 
@@ -203,12 +260,21 @@ async def health():
         has_topic = bool(ntfy_cfg.get("ntfy_topic"))
         notif_status = "ntfy_connected" if (has_server and has_topic) else "misconfigured"
 
+    # Lease stats
+    lease_stats = lease_mgr.stats_today() if lease_mgr else {}
+
+    # MCP status
+    mcp_cfg = cfg.get("mcp", {})
+    mcp_status = "enabled" if mcp_cfg.get("enabled", False) else "disabled"
+
     return {
         "status": "ok" if bw_status == "active" else "degraded",
         "bitwarden": bw_status,
         "fido2": "ready" if has_creds else "no_credentials",
         "authorization_mode": _auth_mode(),
         "notifications": notif_status,
+        "mcp": mcp_status,
+        "leases": lease_stats,
     }
 
 
@@ -228,6 +294,246 @@ async def get_audit(
     if not valid:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return audit_log.recent(limit)
+
+
+# ---------------------------------------------------------------------------
+# Lease expiry daemon (background thread, runs every 30s)
+# ---------------------------------------------------------------------------
+
+def _lease_expiry_daemon():
+    """Background thread that checks for expired leases every 30 seconds.
+
+    For leases with rotate_on_expire, rotates the credential in Bitwarden.
+    """
+    logger.info("Lease expiry daemon started")
+    while not _expiry_stop.is_set():
+        try:
+            expired = lease_mgr.check_expired()
+            for lease in expired:
+                rotated = False
+                # Check if this credential has rotate_on_expire
+                should_rotate = _should_rotate(lease.agent_id, lease.credential_name)
+
+                if should_rotate and bw and bw.state == SessionState.ACTIVE:
+                    try:
+                        bw.rotate_credential(lease.credential_name)
+                        rotated = True
+                        logger.info(
+                            "Rotated credential '%s' after lease %s expired",
+                            lease.credential_name, lease.lease_id[:12],
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to rotate '%s' after lease expiry: %s",
+                            lease.credential_name, e,
+                        )
+                        if _notifications_enabled():
+                            send_rotation_failed_notification(
+                                config=cfg,
+                                credential_name=lease.credential_name,
+                                error=str(e),
+                            )
+
+                if _notifications_enabled():
+                    send_lease_expired_notification(
+                        config=cfg,
+                        agent_id=lease.agent_id,
+                        credential_name=lease.credential_name,
+                        lease_id=lease.lease_id,
+                        rotated=rotated,
+                    )
+
+                # Log lease expiry to audit
+                audit_log.log(
+                    agent_id=lease.agent_id,
+                    credential_name=lease.credential_name,
+                    status="lease_expired",
+                    fields_requested=lease.fields,
+                    purpose=f"lease:{lease.lease_id[:12]}"
+                           + (" (rotated)" if rotated else ""),
+                )
+        except Exception as e:
+            logger.error("Lease expiry daemon error: %s", e)
+
+        _expiry_stop.wait(30)
+    logger.info("Lease expiry daemon stopped")
+
+
+def _should_rotate(agent_id: str, credential_name: str) -> bool:
+    """Check if the credential policy has rotate_on_expire enabled."""
+    policies_dir = cfg.get("policies", {}).get("directory", "policies")
+    agent_policy = load_agent_policy(policies_dir, agent_id)
+    if not agent_policy:
+        return False
+    lease_policy = agent_policy.get_lease_policy(credential_name)
+    return lease_policy.rotate_on_expire
+
+
+# ---------------------------------------------------------------------------
+# Lease endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/leases")
+async def list_leases(
+    agent_id: str | None = Query(None),
+    credential_name: str | None = Query(None),
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """List active leases. Requires a valid agent API key."""
+    valid = any(
+        agent.get("api_key") == x_api_key for agent in _agents.values()
+    )
+    if not valid:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    leases = lease_mgr.get_active_leases(agent_id=agent_id, credential_name=credential_name)
+    return [l.to_dict() for l in leases]
+
+
+class RenewRequest(BaseModel):
+    additional_minutes: int = 15
+
+
+@app.post("/renew/{lease_id}")
+async def renew_lease(
+    lease_id: str,
+    body: RenewRequest,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Extend an active lease's TTL. Must be the owning agent."""
+    # Find the lease
+    lease = lease_mgr.get_lease(lease_id)
+    if not lease:
+        raise HTTPException(status_code=404, detail="Lease not found")
+
+    if lease.state != LeaseState.ACTIVE:
+        raise HTTPException(status_code=409, detail=f"Lease is {lease.state.value}, cannot renew")
+
+    # Validate that the caller owns the lease
+    if not _validate_api_key(lease.agent_id, x_api_key):
+        raise HTTPException(status_code=403, detail="Not the lease owner")
+
+    # Check max_lease_minutes from policy
+    policies_dir = cfg.get("policies", {}).get("directory", "policies")
+    agent_policy = load_agent_policy(policies_dir, lease.agent_id)
+    if agent_policy:
+        lease_policy = agent_policy.get_lease_policy(lease.credential_name)
+        max_seconds = lease_policy.max_lease_seconds
+    else:
+        max_seconds = 60 * 60  # default 60 min
+
+    additional_seconds = body.additional_minutes * 60
+    new_expiry = lease.expires_at + additional_seconds
+    total_duration = new_expiry - lease.created_at
+
+    if total_duration > max_seconds:
+        max_mins = max_seconds // 60
+        raise HTTPException(
+            status_code=403,
+            detail=f"Renewal would exceed max lease duration ({max_mins} min)",
+        )
+
+    renewed = lease_mgr.renew_lease(lease_id, additional_seconds)
+    if not renewed:
+        raise HTTPException(status_code=409, detail="Lease could not be renewed")
+
+    audit_log.log(
+        agent_id=renewed.agent_id,
+        credential_name=renewed.credential_name,
+        status="lease_renewed",
+        purpose=f"lease:{lease_id[:12]} +{body.additional_minutes}min",
+    )
+
+    return renewed.to_dict()
+
+
+class RevokeRequest(BaseModel):
+    reason: str = "no longer needed"
+
+
+@app.post("/revoke/{lease_id}")
+async def revoke_lease(
+    lease_id: str,
+    body: RevokeRequest,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Revoke a specific lease. Must be the owning agent or any valid key."""
+    lease = lease_mgr.get_lease(lease_id)
+    if not lease:
+        raise HTTPException(status_code=404, detail="Lease not found")
+
+    # Owner or any valid agent can revoke
+    is_owner = _validate_api_key(lease.agent_id, x_api_key)
+    is_valid = any(
+        agent.get("api_key") == x_api_key for agent in _agents.values()
+    )
+    if not is_owner and not is_valid:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    revoked = lease_mgr.revoke_lease(lease_id, reason=body.reason)
+    if not revoked:
+        raise HTTPException(status_code=409, detail=f"Lease is not active (state: {lease.state.value})")
+
+    audit_log.log(
+        agent_id=lease.agent_id,
+        credential_name=lease.credential_name,
+        status="lease_revoked",
+        purpose=f"lease:{lease_id[:12]} reason:{body.reason}",
+    )
+
+    if _notifications_enabled():
+        send_lease_revoked_notification(
+            config=cfg,
+            agent_id=lease.agent_id,
+            credential_name=lease.credential_name,
+            lease_id=lease.lease_id,
+            reason=body.reason,
+        )
+
+    return {"status": "revoked", "lease_id": lease_id}
+
+
+class RevokeAllRequest(BaseModel):
+    agent_id: str | None = None
+
+
+@app.post("/revoke-all")
+async def revoke_all_leases(
+    body: RevokeAllRequest,
+    request: Request,
+):
+    """Revoke all active leases. Requires YubiKey touch (safety-critical)."""
+    # This is a dangerous operation — require YubiKey
+    logger.warning("Revoke-all requested — awaiting YubiKey touch")
+    print(
+        f"\n{'='*60}\n"
+        f"  REVOKE ALL LEASES\n"
+        f"  Scope: {body.agent_id or 'ALL AGENTS'}\n"
+        f"{'='*60}\n"
+        f"  >>> Touch your YubiKey to confirm\n"
+    )
+
+    result = _run_fido2_assertion()
+    if not result.success:
+        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+
+    count = lease_mgr.revoke_all(agent_id=body.agent_id)
+
+    audit_log.log(
+        agent_id=body.agent_id or "admin",
+        credential_name="*",
+        status="lease_revoke_all",
+        purpose=f"revoked {count} lease(s)",
+    )
+
+    if _notifications_enabled():
+        send_revoke_all_notification(
+            config=cfg,
+            count=count,
+            agent_id=body.agent_id,
+        )
+
+    return {"status": "revoked", "count": count}
 
 
 # ---------------------------------------------------------------------------
@@ -408,18 +714,24 @@ async def request_credential(
     )
     _print_request_banner(req, mode)
 
+    # Resolve lease policy
+    if decision:
+        lease_pol = decision.lease_policy
+    else:
+        lease_pol = LeasePolicy()  # defaults
+
     # --- Dispatch to mode-specific handler ---
     if auto_approve_seconds:
         return await _handle_auto_approve_mode(
             req, client_ip, start, auto_approve_seconds,
-            alert_always, policy_checks,
+            alert_always, policy_checks, lease_pol,
         )
     elif mode == "yubikey":
-        return await _handle_yubikey_mode(req, client_ip, start, alert_always, policy_checks)
+        return await _handle_yubikey_mode(req, client_ip, start, alert_always, policy_checks, lease_pol)
     elif mode == "phone":
-        return await _handle_phone_mode(req, client_ip, start, alert_always, policy_checks)
+        return await _handle_phone_mode(req, client_ip, start, alert_always, policy_checks, lease_pol)
     elif mode == "both":
-        return await _handle_both_mode(req, client_ip, start, alert_always, policy_checks)
+        return await _handle_both_mode(req, client_ip, start, alert_always, policy_checks, lease_pol)
     else:
         logger.error("Unknown authorization mode: %s", mode)
         raise HTTPException(status_code=500, detail=f"Unknown authorization mode: {mode}")
@@ -432,6 +744,7 @@ async def request_credential(
 async def _handle_yubikey_mode(
     req: CredentialRequest, client_ip: str, start: float,
     alert_always: bool = False, policy_checks: list[dict] | None = None,
+    lease_policy: LeasePolicy | None = None,
 ) -> CredentialResponse:
     """YubiKey-only authorization."""
     # Send informational notification (no action buttons)
@@ -473,6 +786,7 @@ async def _handle_yubikey_mode(
     return _finalize_approval(
         req, client_ip, start, method="yubikey",
         alert_always=alert_always, policy_checks=policy_checks,
+        lease_policy=lease_policy,
     )
 
 
@@ -483,6 +797,7 @@ async def _handle_yubikey_mode(
 async def _handle_phone_mode(
     req: CredentialRequest, client_ip: str, start: float,
     alert_always: bool = False, policy_checks: list[dict] | None = None,
+    lease_policy: LeasePolicy | None = None,
 ) -> CredentialResponse:
     """Phone-only authorization via Ntfy action buttons."""
     timeout = cfg.get("timeouts", {}).get("touch_timeout_seconds", 60)
@@ -512,6 +827,7 @@ async def _handle_phone_mode(
         return _finalize_approval(
             req, client_ip, start, method="phone",
             alert_always=alert_always, policy_checks=policy_checks,
+            lease_policy=lease_policy,
         )
 
     # Denied or expired
@@ -546,6 +862,7 @@ async def _handle_phone_mode(
 async def _handle_both_mode(
     req: CredentialRequest, client_ip: str, start: float,
     alert_always: bool = False, policy_checks: list[dict] | None = None,
+    lease_policy: LeasePolicy | None = None,
 ) -> CredentialResponse:
     """Race FIDO2 touch and phone approval — first one wins."""
     timeout = cfg.get("timeouts", {}).get("touch_timeout_seconds", 60)
@@ -615,6 +932,7 @@ async def _handle_both_mode(
         return _finalize_approval(
             req, client_ip, start, method="yubikey",
             alert_always=alert_always, policy_checks=policy_checks,
+            lease_policy=lease_policy,
         )
 
     if method == "phone":
@@ -622,6 +940,7 @@ async def _handle_both_mode(
         return _finalize_approval(
             req, client_ip, start, method="phone",
             alert_always=alert_always, policy_checks=policy_checks,
+            lease_policy=lease_policy,
         )
 
     if method == "denied":
@@ -669,6 +988,7 @@ async def _handle_auto_approve_mode(
     req: CredentialRequest, client_ip: str, start: float,
     auto_approve_seconds: int, alert_always: bool = False,
     policy_checks: list[dict] | None = None,
+    lease_policy: LeasePolicy | None = None,
 ) -> CredentialResponse:
     """Auto-approve after a timer unless denied via phone.
 
@@ -724,6 +1044,7 @@ async def _handle_auto_approve_mode(
     return _finalize_approval(
         req, client_ip, start, method="auto-approve",
         alert_always=alert_always, policy_checks=policy_checks,
+        lease_policy=lease_policy,
     )
 
 
@@ -734,8 +1055,9 @@ async def _handle_auto_approve_mode(
 def _finalize_approval(
     req: CredentialRequest, client_ip: str, start: float, method: str,
     alert_always: bool = False, policy_checks: list[dict] | None = None,
+    lease_policy: LeasePolicy | None = None,
 ) -> CredentialResponse:
-    """Fetch credential from Bitwarden and return success response."""
+    """Fetch credential from Bitwarden, create a lease, and return response."""
     try:
         extracted = _fetch_credential(req)
     except BitwardenError as e:
@@ -752,6 +1074,37 @@ def _finalize_approval(
         )
         return CredentialResponse(status="denied", reason=f"Bitwarden error: {e}")
 
+    # --- Check concurrent lease limit ---
+    if lease_policy:
+        max_concurrent = lease_policy.max_concurrent_leases
+        current_count = lease_mgr.count_active_for_credential(req.credential_name)
+        if current_count >= max_concurrent:
+            audit_log.log(
+                agent_id=req.agent_id,
+                credential_name=req.credential_name,
+                status="denied",
+                fields_requested=req.fields,
+                purpose=req.purpose,
+                ip_address=client_ip,
+                response_time_ms=_elapsed_ms(start),
+                policy_checks=policy_checks,
+            )
+            return CredentialResponse(
+                status="denied",
+                reason=f"Max concurrent leases reached ({max_concurrent}) for '{req.credential_name}'",
+            )
+
+    # --- Create lease ---
+    ttl = lease_policy.ttl_seconds if lease_policy else 15 * 60
+    lease = lease_mgr.create_lease(
+        agent_id=req.agent_id,
+        credential_name=req.credential_name,
+        fields=req.fields,
+        purpose=req.purpose,
+        ttl_seconds=ttl,
+        approval_method=method,
+    )
+
     audit_log.log(
         agent_id=req.agent_id,
         credential_name=req.credential_name,
@@ -764,8 +1117,9 @@ def _finalize_approval(
     )
 
     logger.info(
-        "Credential '%s' approved for %s via %s",
+        "Credential '%s' approved for %s via %s (lease %s, TTL %ds)",
         req.credential_name, req.agent_id, method,
+        lease.lease_id[:12], ttl,
     )
 
     if _notifications_enabled():
@@ -776,7 +1130,22 @@ def _finalize_approval(
             method=method,
         )
 
-    return CredentialResponse(status="approved", credential=extracted)
+    # Build lease info for response
+    max_lease_seconds = lease_policy.max_lease_seconds if lease_policy else 60 * 60
+    renewable = (lease.expires_at - lease.created_at) < max_lease_seconds
+
+    lease_info = LeaseInfo(
+        lease_id=lease.lease_id,
+        expires_at=_ts_to_iso(lease.expires_at),
+        ttl_seconds=ttl,
+        renewable=renewable,
+    )
+
+    return CredentialResponse(
+        status="approved",
+        credential=extracted,
+        lease=lease_info,
+    )
 
 
 def _elapsed_ms(start: float) -> int:
