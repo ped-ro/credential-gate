@@ -10,6 +10,9 @@ Credentials with rotate_on_expire get new passwords in Bitwarden.
 
 Phase 6: MCP server interface — agents can request credentials through
 their native MCP tool protocol via Streamable HTTP at /mcp.
+
+Phase 7: Execution proxy — agents describe actions and the gate executes
+them with credentials injected.  The agent never sees raw credentials.
 """
 
 import logging
@@ -27,6 +30,7 @@ from bitwarden import BitwardenError, BitwardenSessionManager, SessionState
 from config import load_config
 from fido import AssertionResult, assert_touch
 from leases import LeaseManager, LeaseState, _ts_to_iso
+from proxy import ProxyExecutor, ProxyResult, sanitize_output
 from notifications import (
     send_approval_notification,
     send_approved_notification,
@@ -59,6 +63,7 @@ audit_log: AuditLog | None = None
 bw: BitwardenSessionManager | None = None
 approval_queue = ApprovalQueue()
 lease_mgr: LeaseManager | None = None
+proxy_exec: ProxyExecutor | None = None
 _expiry_stop = threading.Event()  # signal the expiry daemon to stop
 
 
@@ -97,6 +102,12 @@ async def lifespan(app: FastAPI):
     expiry_thread = threading.Thread(target=_lease_expiry_daemon, daemon=True)
     expiry_thread.start()
 
+    # Initialize proxy executor
+    global proxy_exec
+    proxy_exec = ProxyExecutor(cfg)
+    if proxy_exec.enabled:
+        logger.info("Proxy executor enabled with %d action(s)", len(proxy_exec.list_actions()))
+
     # Mount MCP server if enabled
     mcp_cfg = cfg.get("mcp", {})
     if mcp_cfg.get("enabled", False):
@@ -108,6 +119,7 @@ async def lifespan(app: FastAPI):
             approval_queue=approval_queue,
             lease_manager=lease_mgr,
             audit_log=audit_log,
+            proxy_executor=proxy_exec,
         )
         mcp_app = mcp_srv.streamable_http_app()
         mcp_path = mcp_cfg.get("path", "/mcp")
@@ -267,6 +279,13 @@ async def health():
     mcp_cfg = cfg.get("mcp", {})
     mcp_status = "enabled" if mcp_cfg.get("enabled", False) else "disabled"
 
+    # Proxy status
+    proxy_status = "disabled"
+    proxy_action_count = 0
+    if proxy_exec and proxy_exec.enabled:
+        proxy_status = "enabled"
+        proxy_action_count = len(proxy_exec.list_actions())
+
     return {
         "status": "ok" if bw_status == "active" else "degraded",
         "bitwarden": bw_status,
@@ -274,6 +293,8 @@ async def health():
         "authorization_mode": _auth_mode(),
         "notifications": notif_status,
         "mcp": mcp_status,
+        "proxy": proxy_status,
+        "proxy_actions": proxy_action_count,
         "leases": lease_stats,
     }
 
@@ -534,6 +555,271 @@ async def revoke_all_leases(
         )
 
     return {"status": "revoked", "count": count}
+
+
+# ---------------------------------------------------------------------------
+# Proxy endpoints — execute actions without exposing credentials
+# ---------------------------------------------------------------------------
+
+class ProxyRequest(BaseModel):
+    agent_id: str
+    action_name: str
+    purpose: str = ""
+    params: dict = {}
+
+
+class ProxyResponse(BaseModel):
+    action_name: str
+    success: bool
+    status_code: int | None = None
+    exit_code: int | None = None
+    output: str | None = None
+    stderr: str | None = None
+    error: str | None = None
+    execution_time_ms: int = 0
+    truncated: bool = False
+    lease_id: str | None = None
+
+
+@app.get("/proxy/actions")
+async def list_proxy_actions(
+    agent_id: str | None = Query(None),
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """List available proxy actions. Optionally filter by agent policy."""
+    # Validate API key
+    valid = any(
+        agent.get("api_key") == x_api_key for agent in _agents.values()
+    )
+    if not valid:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    if not proxy_exec or not proxy_exec.enabled:
+        return {"actions": [], "proxy_enabled": False}
+
+    all_actions = proxy_exec.list_actions()
+
+    # If agent_id provided, filter by what the agent can access
+    if agent_id:
+        if not _validate_api_key(agent_id, x_api_key):
+            raise HTTPException(status_code=403, detail="API key does not match agent_id")
+
+        filtered = []
+        for action in all_actions:
+            cred_name = action.get("credential_name", "")
+            if _is_credential_allowed(agent_id, cred_name):
+                # Enrich with policy info
+                policies_dir = cfg.get("policies", {}).get("directory", "policies")
+                agent_policy = load_agent_policy(policies_dir, agent_id)
+                if agent_policy:
+                    cred_policy = agent_policy.get_credential_policy(cred_name)
+                    action["risk"] = cred_policy.get("risk", "medium")
+                    action["approval"] = cred_policy.get("approval", agent_policy.default_approval)
+                    action["auto_approve_seconds"] = cred_policy.get("auto_approve_seconds")
+                filtered.append(action)
+        return {"actions": filtered, "proxy_enabled": True}
+
+    return {"actions": all_actions, "proxy_enabled": True}
+
+
+@app.post("/proxy", response_model=ProxyResponse)
+async def execute_proxy(
+    req: ProxyRequest,
+    request: Request,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Execute an action through the proxy. The credential is injected by the
+    gate — the agent never sees it."""
+    start = time.monotonic()
+    client_ip = request.client.host if request.client else "unknown"
+
+    # --- Check proxy is enabled ---
+    if not proxy_exec or not proxy_exec.enabled:
+        raise HTTPException(status_code=404, detail="Proxy is not enabled")
+
+    # --- Authenticate agent ---
+    if not _validate_api_key(req.agent_id, x_api_key):
+        audit_log.log(
+            agent_id=req.agent_id,
+            credential_name=f"proxy:{req.action_name}",
+            status="error",
+            purpose=req.purpose,
+            ip_address=client_ip,
+            response_time_ms=_elapsed_ms(start),
+        )
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # --- Look up proxy action ---
+    action = proxy_exec.get_action(req.action_name)
+    if not action:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown proxy action: '{req.action_name}'",
+        )
+
+    # --- Authorize credential access ---
+    if not _is_credential_allowed(req.agent_id, action.credential_name):
+        audit_log.log(
+            agent_id=req.agent_id,
+            credential_name=action.credential_name,
+            status="denied",
+            purpose=f"proxy:{req.action_name} {req.purpose}",
+            ip_address=client_ip,
+            response_time_ms=_elapsed_ms(start),
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Agent '{req.agent_id}' is not allowed to access credential '{action.credential_name}'",
+        )
+
+    # --- Check Bitwarden availability ---
+    if bw.state in (SessionState.NO_SESSION, SessionState.LOCKED):
+        raise HTTPException(status_code=503, detail="Bitwarden vault unavailable")
+
+    # --- Evaluate policy for the underlying credential ---
+    policies_cfg = cfg.get("policies", {})
+    policies_dir = policies_cfg.get("directory", "policies")
+    default_policy = policies_cfg.get("default_policy", "deny")
+
+    agent_policy = load_agent_policy(policies_dir, req.agent_id)
+
+    if agent_policy is None:
+        if default_policy == "deny":
+            audit_log.log(
+                agent_id=req.agent_id,
+                credential_name=action.credential_name,
+                status="denied",
+                purpose=f"proxy:{req.action_name} {req.purpose}",
+                ip_address=client_ip,
+                response_time_ms=_elapsed_ms(start),
+                policy_checks=[{"check": "policy_file", "allowed": False,
+                                "reason": "No policy file for agent"}],
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"No policy file for agent '{req.agent_id}'",
+            )
+        decision = None
+    else:
+        decision = agent_policy.evaluate(action.credential_name, audit_log)
+        if not decision.allowed:
+            logger.warning(
+                "Policy denied proxy %s/%s: %s",
+                req.agent_id, action.credential_name, decision.reason,
+            )
+            audit_log.log(
+                agent_id=req.agent_id,
+                credential_name=action.credential_name,
+                status="denied",
+                purpose=f"proxy:{req.action_name} {req.purpose}",
+                ip_address=client_ip,
+                response_time_ms=_elapsed_ms(start),
+                policy_checks=decision.checks,
+            )
+            raise HTTPException(status_code=403, detail=decision.reason)
+
+    # Determine effective mode
+    if decision:
+        mode = decision.approval_mode
+        auto_approve_seconds = decision.auto_approve_seconds
+        alert_always = decision.alert_always
+        policy_checks = decision.checks
+        lease_pol = decision.lease_policy
+    else:
+        mode = _auth_mode()
+        auto_approve_seconds = None
+        alert_always = False
+        policy_checks = None
+        lease_pol = LeasePolicy()
+
+    # --- Build a CredentialRequest for the approval flow ---
+    cred_req = CredentialRequest(
+        agent_id=req.agent_id,
+        credential_name=action.credential_name,
+        purpose=f"proxy:{req.action_name} {req.purpose}",
+        fields=[action.credential_field],
+    )
+
+    logger.info(
+        "Proxy request [mode=%s]: %s action '%s' (credential '%s') for '%s'",
+        mode, req.agent_id, req.action_name, action.credential_name, req.purpose,
+    )
+    _print_request_banner(cred_req, mode)
+
+    # --- Run approval flow (same as credential requests) ---
+    if auto_approve_seconds:
+        approval = await _handle_auto_approve_mode(
+            cred_req, client_ip, start, auto_approve_seconds,
+            alert_always, policy_checks, lease_pol,
+        )
+    elif mode == "yubikey":
+        approval = await _handle_yubikey_mode(
+            cred_req, client_ip, start, alert_always, policy_checks, lease_pol,
+        )
+    elif mode == "phone":
+        approval = await _handle_phone_mode(
+            cred_req, client_ip, start, alert_always, policy_checks, lease_pol,
+        )
+    elif mode == "both":
+        approval = await _handle_both_mode(
+            cred_req, client_ip, start, alert_always, policy_checks, lease_pol,
+        )
+    else:
+        raise HTTPException(status_code=500, detail=f"Unknown authorization mode: {mode}")
+
+    # --- If not approved, return the denial ---
+    if approval.status != "approved":
+        return ProxyResponse(
+            action_name=req.action_name,
+            success=False,
+            error=approval.reason or approval.status,
+            execution_time_ms=_elapsed_ms(start),
+        )
+
+    # --- Extract credential for proxy use ---
+    credential_value = approval.credential.get(action.credential_field) if approval.credential else None
+    if not credential_value:
+        return ProxyResponse(
+            action_name=req.action_name,
+            success=False,
+            error=f"Credential field '{action.credential_field}' is empty",
+            execution_time_ms=_elapsed_ms(start),
+        )
+
+    # --- Execute the proxy action ---
+    result: ProxyResult = await proxy_exec.execute(action, credential_value, req.params)
+
+    # --- Audit the proxy execution ---
+    audit_log.log(
+        agent_id=req.agent_id,
+        credential_name=action.credential_name,
+        status="proxy_executed" if result.success else "proxy_failed",
+        purpose=f"proxy:{req.action_name} {req.purpose}",
+        ip_address=client_ip,
+        response_time_ms=_elapsed_ms(start),
+        policy_checks=policy_checks,
+    )
+
+    logger.info(
+        "Proxy action '%s' %s for %s (%dms)",
+        req.action_name,
+        "succeeded" if result.success else "failed",
+        req.agent_id,
+        result.execution_time_ms,
+    )
+
+    return ProxyResponse(
+        action_name=result.action_name,
+        success=result.success,
+        status_code=result.status_code,
+        exit_code=result.exit_code,
+        output=result.response_body or result.stdout,
+        stderr=result.stderr,
+        error=result.error,
+        execution_time_ms=result.execution_time_ms,
+        truncated=result.truncated,
+        lease_id=approval.lease.lease_id if approval.lease else None,
+    )
 
 
 # ---------------------------------------------------------------------------

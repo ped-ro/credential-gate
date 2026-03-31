@@ -42,5 +42,52 @@ mcp:
   path: "/mcp"                    # mount point on the FastAPI app
   server_name: "credential-gate"
 
+proxy:
+  enabled: true
+  actions:
+    github-api:
+      type: "http"
+      credential_name: "github-deploy-token"
+      credential_field: "password"
+      method: null                    # agent specifies per-request
+      url_template: "https://api.github.com/{path}"
+      auth_header_template: "Bearer {credential}"
+      extra_headers:
+        Accept: "application/vnd.github.v3+json"
+        User-Agent: "credential-gate-proxy"
+      timeout_seconds: 30
+      max_response_bytes: 1048576     # 1 MB
+
+    github-git:
+      type: "command"
+      credential_name: "github-deploy-token"
+      credential_field: "password"
+      command_template: "git {args}"
+      env_inject:
+        GIT_ASKPASS: "echo"
+        GIT_TERMINAL_PROMPT: "0"
+      credential_env_var: "GH_TOKEN"
+      allowed_args_pattern: "^(push|pull|fetch|clone|status|log)\\b"
+      timeout_seconds: 120
+      max_response_bytes: 1048576
+
+    ssh-command:
+      type: "command"
+      credential_name: "ssh-key-prod"
+      credential_field: "notes"       # SSH key stored in notes field
+      command_template: "ssh -i {credential_file} {args}"
+      allowed_args_pattern: "^[a-zA-Z0-9_.@-]+\\s"
+      timeout_seconds: 60
+      max_response_bytes: 1048576
+
+    slack-api:
+      type: "http"
+      credential_name: "slack-bot-token"
+      credential_field: "password"
+      url_template: "https://slack.com/api/{path}"
+      auth_header_template: "Bearer {credential}"
+      timeout_seconds: 15
+      max_response_bytes: 524288      # 512 KB
+
 audit:
   db_path: "data/audit.db"

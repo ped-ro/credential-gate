@@ -26,6 +26,7 @@ def create_mcp_server(
     approval_queue,
     lease_manager,
     audit_log,
+    proxy_executor=None,
 ) -> FastMCP:
     """Create and configure the MCP server with all tools.
 
@@ -220,7 +221,8 @@ def create_mcp_server(
         description=(
             "List credentials this agent is allowed to request, filtered by "
             "policy. Returns credential names with their risk levels, approval "
-            "modes, and lease settings."
+            "modes, and lease settings. Also indicates which credentials have "
+            "proxy actions available (execute without seeing raw credentials)."
         ),
     )
     async def list_available_credentials(agent_id: str) -> str:
@@ -244,13 +246,22 @@ def create_mcp_server(
                     if cred_name == "*":
                         continue
                     lease_pol = agent_policy.get_lease_policy(cred_name)
-                    credentials.append({
+                    entry = {
                         "name": cred_name,
                         "risk": cred_cfg.get("risk", "medium"),
                         "approval": cred_cfg.get("approval", agent_policy.default_approval),
                         "auto_approve_seconds": cred_cfg.get("auto_approve_seconds"),
                         "lease_ttl_minutes": lease_pol.lease_ttl_minutes,
-                    })
+                    }
+                    # Add proxy info
+                    if proxy_executor and proxy_executor.enabled:
+                        proxy_actions = proxy_executor.get_actions_for_credential(cred_name)
+                        entry["proxy_available"] = len(proxy_actions) > 0
+                        if proxy_actions:
+                            entry["proxy_actions"] = proxy_actions
+                    else:
+                        entry["proxy_available"] = False
+                    credentials.append(entry)
                 # Include wildcard info
                 wildcard = agent_policy.credentials.get("*", {})
                 if wildcard:
@@ -260,11 +271,13 @@ def create_mcp_server(
                         "risk": wildcard.get("risk", "medium"),
                         "approval": wildcard.get("approval", agent_policy.default_approval),
                         "lease_ttl_minutes": agent_policy.get_lease_policy("*").lease_ttl_minutes,
+                        "proxy_available": False,
                     })
             else:
                 credentials.append({
                     "name": "*",
                     "note": "Wildcard access, no policy file — defaults apply",
+                    "proxy_available": False,
                 })
         else:
             for cred_name in allowed:
@@ -276,6 +289,14 @@ def create_mcp_server(
                     entry["approval"] = cred_cfg.get("approval", agent_policy.default_approval)
                     entry["auto_approve_seconds"] = cred_cfg.get("auto_approve_seconds")
                     entry["lease_ttl_minutes"] = lease_pol.lease_ttl_minutes
+                # Add proxy info
+                if proxy_executor and proxy_executor.enabled:
+                    proxy_actions = proxy_executor.get_actions_for_credential(cred_name)
+                    entry["proxy_available"] = len(proxy_actions) > 0
+                    if proxy_actions:
+                        entry["proxy_actions"] = proxy_actions
+                else:
+                    entry["proxy_available"] = False
                 credentials.append(entry)
 
         return json.dumps({
@@ -408,6 +429,12 @@ def create_mcp_server(
 
         lease_stats = lease_manager.stats_today() if lease_manager else {}
 
+        proxy_status = "disabled"
+        proxy_action_count = 0
+        if proxy_executor and proxy_executor.enabled:
+            proxy_status = "enabled"
+            proxy_action_count = len(proxy_executor.list_actions())
+
         return json.dumps({
             "status": "ok" if bw_status == "active" else "degraded",
             "bitwarden": bw_status,
@@ -415,7 +442,208 @@ def create_mcp_server(
             "authorization_mode": _auth_mode(),
             "notifications": notif_status,
             "mcp": "enabled",
+            "proxy": proxy_status,
+            "proxy_actions": proxy_action_count,
             "leases": lease_stats,
         })
+
+    @mcp.tool(
+        description=(
+            "List available proxy actions. Proxy actions let you perform "
+            "operations (HTTP requests, git commands, etc.) without seeing "
+            "raw credentials. The gate executes the action on your behalf "
+            "with credentials injected. Returns action names, types, and "
+            "configuration."
+        ),
+    )
+    async def list_proxy_actions(agent_id: str) -> str:
+        if agent_id not in agents:
+            return json.dumps({"status": "error", "reason": f"Unknown agent '{agent_id}'"})
+
+        if not proxy_executor or not proxy_executor.enabled:
+            return json.dumps({"proxy_enabled": False, "actions": []})
+
+        from policy import load_agent_policy
+
+        all_actions = proxy_executor.list_actions()
+
+        # Filter by what the agent can access
+        filtered = []
+        for action in all_actions:
+            cred_name = action.get("credential_name", "")
+            if _is_credential_allowed(agent_id, cred_name):
+                # Enrich with policy info
+                policies_dir = config.get("policies", {}).get("directory", "policies")
+                agent_policy = load_agent_policy(policies_dir, agent_id)
+                if agent_policy:
+                    cred_policy = agent_policy.get_credential_policy(cred_name)
+                    action["risk"] = cred_policy.get("risk", "medium")
+                    action["approval"] = cred_policy.get("approval", agent_policy.default_approval)
+                    action["auto_approve_seconds"] = cred_policy.get("auto_approve_seconds")
+                filtered.append(action)
+
+        return json.dumps({"proxy_enabled": True, "actions": filtered})
+
+    @mcp.tool(
+        description=(
+            "Execute an action through the Credential Gate proxy. The agent "
+            "describes what it wants to do, and the gate executes it with "
+            "the required credentials injected — the agent never sees raw "
+            "credentials. Triggers approval flow (YubiKey/phone/auto per "
+            "policy) before execution.\n\n"
+            "Use list_proxy_actions to see available actions.\n\n"
+            "For HTTP actions, params should include: "
+            '{"method": "GET", "path": "repos/owner/repo", "body": {...}}\n'
+            "For command actions, params should include: "
+            '{"args": "push origin main"}'
+        ),
+    )
+    async def execute_proxy_action(
+        agent_id: str,
+        action_name: str,
+        purpose: str = "",
+        params: dict | None = None,
+    ) -> str:
+        if params is None:
+            params = {}
+
+        if agent_id not in agents:
+            return json.dumps({"status": "error", "reason": f"Unknown agent '{agent_id}'"})
+
+        if not proxy_executor or not proxy_executor.enabled:
+            return json.dumps({"status": "error", "reason": "Proxy is not enabled"})
+
+        # Look up action
+        action = proxy_executor.get_action(action_name)
+        if not action:
+            return json.dumps({
+                "status": "error",
+                "reason": f"Unknown proxy action: '{action_name}'",
+            })
+
+        # Authorize credential access
+        if not _is_credential_allowed(agent_id, action.credential_name):
+            return json.dumps({
+                "status": "denied",
+                "reason": f"Agent '{agent_id}' is not allowed to access credential '{action.credential_name}'",
+            })
+
+        # Check Bitwarden availability
+        from bitwarden import SessionState
+        if bw_manager.state in (SessionState.NO_SESSION, SessionState.LOCKED):
+            return json.dumps({"status": "error", "reason": "Bitwarden vault unavailable"})
+
+        # Evaluate policy
+        from policy import LeasePolicy, load_agent_policy
+
+        policies_cfg = config.get("policies", {})
+        policies_dir = policies_cfg.get("directory", "policies")
+        default_policy = policies_cfg.get("default_policy", "deny")
+
+        agent_policy = load_agent_policy(policies_dir, agent_id)
+
+        if agent_policy is None:
+            if default_policy == "deny":
+                return json.dumps({
+                    "status": "denied",
+                    "reason": f"No policy file for agent '{agent_id}'",
+                })
+            decision = None
+        else:
+            decision = agent_policy.evaluate(action.credential_name, audit_log)
+            if not decision.allowed:
+                return json.dumps({
+                    "status": "denied",
+                    "reason": decision.reason,
+                })
+
+        # Determine effective mode
+        if decision:
+            mode = decision.approval_mode
+            auto_approve_seconds = decision.auto_approve_seconds
+            alert_always = decision.alert_always
+            policy_checks = decision.checks
+            lease_pol = decision.lease_policy
+        else:
+            mode = _auth_mode()
+            auto_approve_seconds = None
+            alert_always = False
+            policy_checks = None
+            lease_pol = LeasePolicy()
+
+        # Build credential request for approval flow
+        from main import (
+            CredentialRequest,
+            _handle_auto_approve_mode,
+            _handle_both_mode,
+            _handle_phone_mode,
+            _handle_yubikey_mode,
+            _print_request_banner,
+        )
+
+        cred_req = CredentialRequest(
+            agent_id=agent_id,
+            credential_name=action.credential_name,
+            purpose=f"proxy:{action_name} {purpose}",
+            fields=[action.credential_field],
+        )
+
+        _print_request_banner(cred_req, mode)
+
+        client_ip = "mcp"
+        start = time.monotonic()
+
+        # Dispatch approval
+        if auto_approve_seconds:
+            approval = await _handle_auto_approve_mode(
+                cred_req, client_ip, start, auto_approve_seconds,
+                alert_always, policy_checks, lease_pol,
+            )
+        elif mode == "yubikey":
+            approval = await _handle_yubikey_mode(
+                cred_req, client_ip, start, alert_always, policy_checks, lease_pol,
+            )
+        elif mode == "phone":
+            approval = await _handle_phone_mode(
+                cred_req, client_ip, start, alert_always, policy_checks, lease_pol,
+            )
+        elif mode == "both":
+            approval = await _handle_both_mode(
+                cred_req, client_ip, start, alert_always, policy_checks, lease_pol,
+            )
+        else:
+            return json.dumps({"status": "error", "reason": f"Unknown authorization mode: {mode}"})
+
+        # If not approved, return denial
+        if approval.status != "approved":
+            return json.dumps({
+                "status": approval.status,
+                "reason": approval.reason or approval.status,
+            })
+
+        # Extract credential for proxy use
+        credential_value = (
+            approval.credential.get(action.credential_field)
+            if approval.credential else None
+        )
+        if not credential_value:
+            return json.dumps({
+                "status": "error",
+                "reason": f"Credential field '{action.credential_field}' is empty",
+            })
+
+        # Execute the proxy action
+        result = await proxy_executor.execute(action, credential_value, params)
+
+        # Audit
+        audit_log.log(
+            agent_id=agent_id,
+            credential_name=action.credential_name,
+            status="proxy_executed" if result.success else "proxy_failed",
+            purpose=f"proxy:{action_name} {purpose} (mcp)",
+            policy_checks=policy_checks,
+        )
+
+        return json.dumps(result.to_dict())
 
     return mcp
