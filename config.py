@@ -45,4 +45,10 @@ def load_config(path: str | Path | None = None) -> dict:
     if bw.get("cli_path"):
         bw["cli_path"] = str(_resolve_path(bw["cli_path"], "bw"))
 
+    # Resolve policies directory
+    cfg.setdefault("policies", {})
+    cfg["policies"]["directory"] = str(
+        _resolve_path(cfg["policies"].get("directory"), "policies")
+    )
+
     return cfg

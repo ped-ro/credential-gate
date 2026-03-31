@@ -16,8 +16,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
     purpose TEXT,
     status TEXT NOT NULL,
     ip_address TEXT,
-    response_time_ms INTEGER
+    response_time_ms INTEGER,
+    policy_checks TEXT
 );
+"""
+
+_MIGRATE_POLICY_CHECKS = """\
+ALTER TABLE audit_log ADD COLUMN policy_checks TEXT;
 """
 
 
@@ -29,6 +34,16 @@ class AuditLog:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_CREATE_TABLE)
         self._conn.commit()
+        # Migrate existing DBs: add policy_checks column if missing
+        self._migrate()
+
+    def _migrate(self):
+        """Add columns introduced in later phases (idempotent)."""
+        cursor = self._conn.execute("PRAGMA table_info(audit_log)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "policy_checks" not in columns:
+            self._conn.execute(_MIGRATE_POLICY_CHECKS)
+            self._conn.commit()
 
     def log(
         self,
@@ -39,14 +54,15 @@ class AuditLog:
         purpose: str | None = None,
         ip_address: str | None = None,
         response_time_ms: int | None = None,
+        policy_checks: list[dict] | None = None,
     ) -> int:
         """Insert an audit record. Returns the row id."""
         cur = self._conn.execute(
             """\
             INSERT INTO audit_log
                 (timestamp, agent_id, credential_name, fields_requested,
-                 purpose, status, ip_address, response_time_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 purpose, status, ip_address, response_time_ms, policy_checks)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -57,6 +73,7 @@ class AuditLog:
                 status,
                 ip_address,
                 response_time_ms,
+                json.dumps(policy_checks) if policy_checks else None,
             ),
         )
         self._conn.commit()

@@ -4,8 +4,8 @@ Physical authorization gate: AI agents request credentials, and a
 YubiKey touch, phone approval, or either-first-wins authorizes access.
 The credential is fetched fresh from Bitwarden on every approved request.
 
-Phase 3: Ntfy.sh notifications, phone approval, three authorization
-modes (yubikey / phone / both), pending request queue.
+Phase 4: YAML-based policy engine — schedule, rate limits, cooldowns,
+prerequisites, per-credential approval mode overrides, auto-approve timers.
 """
 
 import logging
@@ -24,9 +24,11 @@ from fido import AssertionResult, assert_touch
 from notifications import (
     send_approval_notification,
     send_approved_notification,
+    send_auto_approve_notification,
     send_timeout_notification,
     send_touch_notification,
 )
+from policy import load_agent_policy
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -286,7 +288,6 @@ async def request_credential(
 ):
     start = time.monotonic()
     client_ip = request.client.host if request.client else "unknown"
-    mode = _auth_mode()
 
     # --- Authenticate agent ---
     if not _validate_api_key(req.agent_id, x_api_key):
@@ -336,6 +337,71 @@ async def request_credential(
         )
         raise HTTPException(status_code=503, detail=detail)
 
+    # --- Evaluate policy ---
+    policies_cfg = cfg.get("policies", {})
+    policies_dir = policies_cfg.get("directory", "policies")
+    default_policy = policies_cfg.get("default_policy", "deny")
+
+    agent_policy = load_agent_policy(policies_dir, req.agent_id)
+
+    if agent_policy is None:
+        if default_policy == "deny":
+            audit_log.log(
+                agent_id=req.agent_id,
+                credential_name=req.credential_name,
+                status="denied",
+                fields_requested=req.fields,
+                purpose=req.purpose,
+                ip_address=client_ip,
+                response_time_ms=_elapsed_ms(start),
+                policy_checks=[{"check": "policy_file", "allowed": False,
+                                "reason": "No policy file for agent"}],
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"No policy file for agent '{req.agent_id}'",
+            )
+        # default_policy == "allow_all": skip policy checks, use config-level mode
+        decision = None
+    else:
+        decision = agent_policy.evaluate(req.credential_name, audit_log)
+        if not decision.allowed:
+            logger.warning(
+                "Policy denied %s/%s: %s",
+                req.agent_id, req.credential_name, decision.reason,
+            )
+            audit_log.log(
+                agent_id=req.agent_id,
+                credential_name=req.credential_name,
+                status="denied",
+                fields_requested=req.fields,
+                purpose=req.purpose,
+                ip_address=client_ip,
+                response_time_ms=_elapsed_ms(start),
+                policy_checks=decision.checks,
+            )
+            # Send alert if flagged
+            if decision.alert_always and _notifications_enabled():
+                send_touch_notification(
+                    config=cfg,
+                    agent_id=req.agent_id,
+                    credential_name=req.credential_name,
+                    purpose=f"DENIED: {decision.reason}",
+                )
+            raise HTTPException(status_code=403, detail=decision.reason)
+
+    # Determine effective mode: policy overrides config
+    if decision:
+        mode = decision.approval_mode
+        auto_approve_seconds = decision.auto_approve_seconds
+        alert_always = decision.alert_always
+        policy_checks = decision.checks
+    else:
+        mode = _auth_mode()
+        auto_approve_seconds = None
+        alert_always = False
+        policy_checks = None
+
     logger.info(
         "Credential request [mode=%s]: %s requests '%s' for '%s'",
         mode, req.agent_id, req.credential_name, req.purpose,
@@ -343,12 +409,17 @@ async def request_credential(
     _print_request_banner(req, mode)
 
     # --- Dispatch to mode-specific handler ---
-    if mode == "yubikey":
-        return await _handle_yubikey_mode(req, client_ip, start)
+    if auto_approve_seconds:
+        return await _handle_auto_approve_mode(
+            req, client_ip, start, auto_approve_seconds,
+            alert_always, policy_checks,
+        )
+    elif mode == "yubikey":
+        return await _handle_yubikey_mode(req, client_ip, start, alert_always, policy_checks)
     elif mode == "phone":
-        return await _handle_phone_mode(req, client_ip, start)
+        return await _handle_phone_mode(req, client_ip, start, alert_always, policy_checks)
     elif mode == "both":
-        return await _handle_both_mode(req, client_ip, start)
+        return await _handle_both_mode(req, client_ip, start, alert_always, policy_checks)
     else:
         logger.error("Unknown authorization mode: %s", mode)
         raise HTTPException(status_code=500, detail=f"Unknown authorization mode: {mode}")
@@ -360,6 +431,7 @@ async def request_credential(
 
 async def _handle_yubikey_mode(
     req: CredentialRequest, client_ip: str, start: float,
+    alert_always: bool = False, policy_checks: list[dict] | None = None,
 ) -> CredentialResponse:
     """YubiKey-only authorization."""
     # Send informational notification (no action buttons)
@@ -393,11 +465,15 @@ async def _handle_yubikey_mode(
             purpose=req.purpose,
             ip_address=client_ip,
             response_time_ms=_elapsed_ms(start),
+            policy_checks=policy_checks,
         )
         return CredentialResponse(status=status, reason=result.error)
 
     # Approved — fetch credential
-    return _finalize_approval(req, client_ip, start, method="yubikey")
+    return _finalize_approval(
+        req, client_ip, start, method="yubikey",
+        alert_always=alert_always, policy_checks=policy_checks,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +482,7 @@ async def _handle_yubikey_mode(
 
 async def _handle_phone_mode(
     req: CredentialRequest, client_ip: str, start: float,
+    alert_always: bool = False, policy_checks: list[dict] | None = None,
 ) -> CredentialResponse:
     """Phone-only authorization via Ntfy action buttons."""
     timeout = cfg.get("timeouts", {}).get("touch_timeout_seconds", 60)
@@ -432,7 +509,10 @@ async def _handle_phone_mode(
     state = approval_queue.wait(pending.request_id, timeout)
 
     if state == ApprovalState.APPROVED:
-        return _finalize_approval(req, client_ip, start, method="phone")
+        return _finalize_approval(
+            req, client_ip, start, method="phone",
+            alert_always=alert_always, policy_checks=policy_checks,
+        )
 
     # Denied or expired
     status = "denied" if state == ApprovalState.DENIED else "timeout"
@@ -454,6 +534,7 @@ async def _handle_phone_mode(
         purpose=req.purpose,
         ip_address=client_ip,
         response_time_ms=_elapsed_ms(start),
+        policy_checks=policy_checks,
     )
     return CredentialResponse(status=status, reason=reason)
 
@@ -464,6 +545,7 @@ async def _handle_phone_mode(
 
 async def _handle_both_mode(
     req: CredentialRequest, client_ip: str, start: float,
+    alert_always: bool = False, policy_checks: list[dict] | None = None,
 ) -> CredentialResponse:
     """Race FIDO2 touch and phone approval — first one wins."""
     timeout = cfg.get("timeouts", {}).get("touch_timeout_seconds", 60)
@@ -530,11 +612,17 @@ async def _handle_both_mode(
 
     if method == "yubikey":
         logger.info("Race won by YubiKey touch")
-        return _finalize_approval(req, client_ip, start, method="yubikey")
+        return _finalize_approval(
+            req, client_ip, start, method="yubikey",
+            alert_always=alert_always, policy_checks=policy_checks,
+        )
 
     if method == "phone":
         logger.info("Race won by phone approval")
-        return _finalize_approval(req, client_ip, start, method="phone")
+        return _finalize_approval(
+            req, client_ip, start, method="phone",
+            alert_always=alert_always, policy_checks=policy_checks,
+        )
 
     if method == "denied":
         logger.warning("Request denied via phone")
@@ -546,6 +634,7 @@ async def _handle_both_mode(
             purpose=req.purpose,
             ip_address=client_ip,
             response_time_ms=_elapsed_ms(start),
+            policy_checks=policy_checks,
         )
         return CredentialResponse(status="denied", reason="Denied via phone")
 
@@ -567,8 +656,75 @@ async def _handle_both_mode(
         purpose=req.purpose,
         ip_address=client_ip,
         response_time_ms=_elapsed_ms(start),
+        policy_checks=policy_checks,
     )
     return CredentialResponse(status="timeout", reason="timeout")
+
+
+# ---------------------------------------------------------------------------
+# Mode: auto-approve (low-risk credentials with auto_approve_seconds)
+# ---------------------------------------------------------------------------
+
+async def _handle_auto_approve_mode(
+    req: CredentialRequest, client_ip: str, start: float,
+    auto_approve_seconds: int, alert_always: bool = False,
+    policy_checks: list[dict] | None = None,
+) -> CredentialResponse:
+    """Auto-approve after a timer unless denied via phone.
+
+    Flow:
+    1. Send informational Ntfy with Deny button and countdown
+    2. Wait for auto_approve_seconds
+    3. If deny callback arrives → deny
+    4. If timer expires with no deny → auto-approve
+    """
+    # Create pending request so deny callback can cancel
+    pending = approval_queue.create(
+        agent_id=req.agent_id,
+        credential_name=req.credential_name,
+        purpose=req.purpose,
+        fields=req.fields,
+    )
+
+    # Send notification with Deny button and auto-approve countdown
+    if _notifications_enabled():
+        send_auto_approve_notification(
+            config=cfg,
+            request_id=pending.request_id,
+            agent_id=req.agent_id,
+            credential_name=req.credential_name,
+            purpose=req.purpose,
+            seconds=auto_approve_seconds,
+        )
+
+    logger.info(
+        "Auto-approve timer started for '%s' (%ds)",
+        req.credential_name, auto_approve_seconds,
+    )
+
+    # Wait for deny or timeout (auto-approve on expiry)
+    state = approval_queue.wait(pending.request_id, auto_approve_seconds)
+
+    if state == ApprovalState.DENIED:
+        logger.warning("Auto-approve denied via phone for '%s'", req.credential_name)
+        audit_log.log(
+            agent_id=req.agent_id,
+            credential_name=req.credential_name,
+            status="denied",
+            fields_requested=req.fields,
+            purpose=req.purpose,
+            ip_address=client_ip,
+            response_time_ms=_elapsed_ms(start),
+            policy_checks=policy_checks,
+        )
+        return CredentialResponse(status="denied", reason="Denied via phone (auto-approve cancelled)")
+
+    # Timer expired with no deny → auto-approve
+    logger.info("Auto-approved '%s' for %s (no deny received)", req.credential_name, req.agent_id)
+    return _finalize_approval(
+        req, client_ip, start, method="auto-approve",
+        alert_always=alert_always, policy_checks=policy_checks,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +733,7 @@ async def _handle_both_mode(
 
 def _finalize_approval(
     req: CredentialRequest, client_ip: str, start: float, method: str,
+    alert_always: bool = False, policy_checks: list[dict] | None = None,
 ) -> CredentialResponse:
     """Fetch credential from Bitwarden and return success response."""
     try:
@@ -591,6 +748,7 @@ def _finalize_approval(
             purpose=req.purpose,
             ip_address=client_ip,
             response_time_ms=_elapsed_ms(start),
+            policy_checks=policy_checks,
         )
         return CredentialResponse(status="denied", reason=f"Bitwarden error: {e}")
 
@@ -602,6 +760,7 @@ def _finalize_approval(
         purpose=req.purpose,
         ip_address=client_ip,
         response_time_ms=_elapsed_ms(start),
+        policy_checks=policy_checks,
     )
 
     logger.info(

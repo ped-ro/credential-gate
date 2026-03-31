@@ -120,6 +120,60 @@ def send_touch_notification(
         return False
 
 
+def send_auto_approve_notification(
+    config: dict,
+    request_id: str,
+    agent_id: str,
+    credential_name: str,
+    purpose: str,
+    seconds: int,
+) -> bool:
+    """Send Ntfy notification for auto-approve countdown with Deny button.
+
+    Used for low-risk credentials with auto_approve_seconds. The user can
+    tap Deny to cancel the auto-approval. Returns True if sent. Never raises.
+    """
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+        callback_base = config["notifications"]["callback_base_url"]
+
+        deny_url = f"{callback_base}/deny/{request_id}"
+
+        purpose_text = f"\nPurpose: {purpose}" if purpose else ""
+        message = (
+            f"Auto-approving '{credential_name}' for {agent_id} in {seconds}s"
+            f"{purpose_text}\nTap Deny to block"
+        )
+
+        headers = {
+            "Title": "Credential Gate — Auto-Approve",
+            "Priority": "default",
+            "Tags": "timer_clock",
+            "Actions": f"http, Deny, {deny_url}, method=POST, clear=true",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Auto-approve notification sent for '%s'", credential_name)
+                return True
+            else:
+                logger.warning("Ntfy returned status %d", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send auto-approve notification: %s", e)
+        return False
+
+
 def send_timeout_notification(
     config: dict,
     agent_id: str,

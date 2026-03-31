@@ -142,6 +142,44 @@ def cmd_check():
         if "CHANGE_ME" in key:
             print(f"  WARNING: Agent '{name}' still has placeholder API key")
 
+    # Policy files
+    from pathlib import Path
+    from policy import validate_policy_file
+
+    policies_cfg = cfg.get("policies", {})
+    policies_dir = Path(policies_cfg.get("directory", "policies"))
+    default_policy = policies_cfg.get("default_policy", "deny")
+    print(f"\nPolicies directory: {policies_dir}")
+    print(f"Default policy: {default_policy}")
+
+    if policies_dir.exists():
+        policy_files = sorted(policies_dir.glob("*.yaml"))
+        if policy_files:
+            for pf in policy_files:
+                agent_name = pf.stem
+                errors = validate_policy_file(pf)
+                if errors:
+                    print(f"  Policy '{agent_name}': INVALID")
+                    for err in errors:
+                        print(f"    - {err}")
+                else:
+                    print(f"  Policy '{agent_name}': valid")
+
+            # Check that all configured agents have policy files
+            policy_agents = {pf.stem for pf in policy_files}
+            for agent_name in agents:
+                if agent_name not in policy_agents:
+                    if default_policy == "deny":
+                        print(f"  WARNING: Agent '{agent_name}' has no policy file (will be denied)")
+                    else:
+                        print(f"  INFO: Agent '{agent_name}' has no policy file (allow_all)")
+        else:
+            print("  No policy files found")
+            if default_policy == "deny":
+                print("  WARNING: All agents will be denied (default_policy=deny)")
+    else:
+        print(f"  WARNING: Policies directory '{policies_dir}' does not exist")
+
     print(f"\nServer: {cfg['server']['host']}:{cfg['server']['port']}")
     print(f"Audit DB: {cfg['audit']['db_path']}")
 

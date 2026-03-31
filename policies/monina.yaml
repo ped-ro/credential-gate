@@ -1,0 +1,44 @@
+agent_id: monina
+
+# Default approval mode (can be overridden per-credential)
+default_approval: "both"  # yubikey, phone, both
+
+# Time windows (UTC or local with timezone)
+schedule:
+  timezone: "America/Los_Angeles"
+  allowed_hours: "06:00-23:00"  # deny outside these hours unless override
+  override_approval: "yubikey"   # if requesting outside hours, require yubikey only (no phone)
+
+# Rate limits
+rate_limits:
+  per_minute: 5
+  per_hour: 30
+  per_day: 100
+  on_exceed: "deny_and_alert"  # "deny", "deny_and_alert", "queue"
+
+# Credential-level policies
+credentials:
+  # Wildcard default
+  "*":
+    risk: "medium"
+    approval: "both"
+    cooldown_minutes: 0
+
+  # Specific overrides
+  "github-deploy-token":
+    risk: "low"
+    approval: "phone"       # phone-only is fine for low risk
+    cooldown_minutes: 0
+    auto_approve_seconds: 30  # auto-approve after 30s if no deny
+
+  "production-db-password":
+    risk: "high"
+    approval: "yubikey"     # yubikey only, no phone for high risk
+    cooldown_minutes: 60    # can't re-request within 60 min
+    requires: ["vpn-credential"]  # must have requested VPN first
+
+  "aws-root-key":
+    risk: "critical"
+    approval: "yubikey"
+    cooldown_minutes: 1440  # once per day max
+    alert_always: true      # always send notification even if approved
