@@ -2,4 +2,3 @@ fastapi>=0.104.0
 uvicorn>=0.24.0
 fido2>=1.1.0
 pyyaml>=6.0
-aiohttp>=3.9.0

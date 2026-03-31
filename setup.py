@@ -4,9 +4,9 @@
 Usage:
     python setup.py register         Register a YubiKey for FIDO2 assertion
     python setup.py gen-key          Generate an API key for an agent
-    python setup.py check            Verify device, config, and Bitwarden status
+    python setup.py check            Verify device, config, and service status
     python setup.py store-password   Store Bitwarden master password in Keychain
-    python setup.py store-ha-token   Store Home Assistant token in Keychain
+    python setup.py test-ntfy        Send a test notification via Ntfy
 """
 
 import getpass
@@ -112,10 +112,25 @@ def cmd_check():
     has_bw_pw = keychain_retrieve(kc_service, kc_account) is not None
     print(f"Keychain (BW password): {'STORED' if has_bw_pw else 'NOT SET — run: python setup.py store-password'}")
 
+    # Authorization mode
+    mode = cfg.get("authorization", {}).get("mode", "yubikey")
+    print(f"Authorization mode: {mode}")
+
+    # Ntfy status
     notif_cfg = cfg.get("notifications", {})
-    ha_account = notif_cfg.get("ha_keychain_account", "home-assistant")
-    has_ha_token = keychain_retrieve(kc_service, ha_account) is not None
-    print(f"Keychain (HA token):    {'STORED' if has_ha_token else 'NOT SET — run: python setup.py store-ha-token'}")
+    if notif_cfg.get("enabled", False):
+        ntfy_server = notif_cfg.get("ntfy_server", "")
+        ntfy_topic = notif_cfg.get("ntfy_topic", "")
+        callback_url = notif_cfg.get("callback_base_url", "")
+        print(f"Ntfy server: {ntfy_server}")
+        print(f"Ntfy topic: {ntfy_topic}")
+        print(f"Callback URL: {callback_url}")
+        if not ntfy_server or not ntfy_topic:
+            print("  WARNING: Ntfy not fully configured")
+        if "CHANGEME" in ntfy_topic:
+            print("  WARNING: Ntfy topic still has placeholder value")
+    else:
+        print("Notifications: disabled")
 
     # Config
     agents = cfg.get("agents", {})
@@ -169,38 +184,39 @@ def cmd_store_password():
     print("The service will use this to unlock Bitwarden automatically.")
 
 
-def cmd_store_ha_token():
-    """Store the Home Assistant long-lived access token in macOS Keychain."""
-    from bitwarden import keychain_store, keychain_retrieve
+def cmd_test_ntfy():
+    """Send a test notification to verify Ntfy.sh connectivity."""
+    from notifications import test_ntfy
 
     cfg = load_config()
-    bw_cfg = cfg.get("bitwarden", {})
     notif_cfg = cfg.get("notifications", {})
-    service = bw_cfg.get("keychain_service", "credential-gate")
-    account = notif_cfg.get("ha_keychain_account", "home-assistant")
 
-    print("Credential Gate — Store Home Assistant Token")
-    print("=" * 50)
-    print(f"\nKeychain service: {service}")
-    print(f"Keychain account: {account}")
+    print("Credential Gate — Test Ntfy Notification")
+    print("=" * 40)
 
-    # Check if already stored
-    existing = keychain_retrieve(service, account)
-    if existing:
-        print("\nA token is already stored in Keychain for this entry.")
-        confirm = input("Overwrite? [y/N] ").strip().lower()
-        if confirm != "y":
-            print("Aborted.")
-            return
-
-    token = getpass.getpass("\nHome Assistant long-lived access token: ")
-    if not token:
-        print("ERROR: Token cannot be empty.")
+    if not notif_cfg.get("enabled", False):
+        print("\nNotifications are disabled in config.yaml.")
+        print("Set notifications.enabled to true and try again.")
         sys.exit(1)
 
-    keychain_store(service, account, token)
-    print("\nToken stored in macOS Keychain.")
-    print("The service will use this to send push notifications via Home Assistant.")
+    ntfy_server = notif_cfg.get("ntfy_server", "")
+    ntfy_topic = notif_cfg.get("ntfy_topic", "")
+
+    if not ntfy_server or not ntfy_topic:
+        print("\nNtfy server or topic not configured in config.yaml.")
+        sys.exit(1)
+
+    print(f"\nServer: {ntfy_server}")
+    print(f"Topic:  {ntfy_topic}")
+    print("Sending test notification...")
+
+    if test_ntfy(cfg):
+        print("\nTest notification sent successfully!")
+        print("Check the Ntfy app on your phone for the notification.")
+    else:
+        print("\nFailed to send test notification.")
+        print("Check your ntfy_server and ntfy_topic settings in config.yaml.")
+        sys.exit(1)
 
 
 def main():
@@ -214,7 +230,7 @@ def main():
         "gen-key": cmd_gen_key,
         "check": cmd_check,
         "store-password": cmd_store_password,
-        "store-ha-token": cmd_store_ha_token,
+        "test-ntfy": cmd_test_ntfy,
     }
 
     fn = commands.get(cmd)

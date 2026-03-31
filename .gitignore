@@ -9,7 +9,7 @@ data/*.db
 
 # Prompt files (internal)
 PROMPT.md
-PHASE2.md
+PHASE*.md
 
 # Python
 __pycache__/

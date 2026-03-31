@@ -19,14 +19,19 @@ fido2:
   rp_name: "Credential Gate"
   credential_store: "data/fido2_credentials.json"
 
+authorization:
+  mode: "both"  # "yubikey", "phone", or "both"
+
 timeouts:
   touch_timeout_seconds: 60
   session_timeout_seconds: 300
 
 notifications:
   enabled: true
-  ha_url: "http://YOUR_HA_IP:8123"
-  ha_keychain_account: "home-assistant"
+  ntfy_server: "https://ntfy.sh"          # or self-hosted URL
+  ntfy_topic: "credential-gate-CHANGEME"   # unique topic name
+  ntfy_token: null                         # optional, for self-hosted with auth
+  callback_base_url: "http://127.0.0.1:8200"  # or Cloudflare tunnel URL for remote
 
 audit:
   db_path: "data/audit.db"
