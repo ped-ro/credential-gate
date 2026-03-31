@@ -1,0 +1,30 @@
+# Config with real secrets
+config.yaml
+
+# Registered YubiKey credentials
+data/fido2_credentials.json
+
+# Audit database
+data/*.db
+
+# Prompt files (internal)
+PROMPT.md
+PHASE2.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+com.pete.credential-gate.plist

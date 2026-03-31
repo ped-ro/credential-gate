@@ -1,0 +1,32 @@
+server:
+  host: "127.0.0.1"
+  port: 8200
+
+agents:
+  my-agent:
+    api_key: "generate-with-python-setup-gen-key"
+    allowed_credentials: ["*"]  # or ["specific-item-name"]
+
+bitwarden:
+  cli_path: null  # auto-detected if on PATH
+  session_timeout_seconds: 300
+  keychain_service: "credential-gate"
+  keychain_account: "bitwarden"
+  session_refresh_minutes: 10
+
+fido2:
+  rp_id: "credential-gate.local"
+  rp_name: "Credential Gate"
+  credential_store: "data/fido2_credentials.json"
+
+timeouts:
+  touch_timeout_seconds: 60
+  session_timeout_seconds: 300
+
+notifications:
+  enabled: true
+  ha_url: "http://YOUR_HA_IP:8123"
+  ha_keychain_account: "home-assistant"
+
+audit:
+  db_path: "data/audit.db"
