@@ -5,6 +5,7 @@ No external dependencies — all HTML, CSS, and JS inline in a single template.
 Auto-refreshes by polling /stats and /leases every 10 seconds.
 
 Phase 8 implementation. Phase 11: circuit breaker + cache indicators.
+Phase 12: security tier indicator + elevated approval for silver tier.
 """
 
 DASHBOARD_HTML = """\
@@ -93,6 +94,24 @@ tr.info td{border-left:3px solid var(--blue)}
 .btn-revoke{background:var(--red);color:#fff;border:none;padding:4px 10px;border-radius:4px;font-size:12px;cursor:pointer;font-family:var(--font)}
 .btn-revoke:hover{opacity:0.8}
 
+/* Tier badge */
+.tier-badge{font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;text-transform:uppercase;letter-spacing:0.5px}
+.tier-badge.gold{background:#d29922;color:#0d1117}
+.tier-badge.silver{background:var(--fg2);color:#0d1117}
+
+/* Elevated approval modal */
+.modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;z-index:1000}
+.modal-overlay.visible{display:flex}
+.modal-box{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:420px;width:90%;text-align:center}
+.modal-box h3{margin-bottom:12px;font-size:16px}
+.modal-box p{font-size:13px;color:var(--fg2);margin-bottom:16px}
+.modal-box input[type=text]{background:var(--bg);border:1px solid var(--border);color:var(--fg);font-size:24px;text-align:center;letter-spacing:8px;padding:10px;border-radius:6px;width:200px;font-family:monospace}
+.modal-box .modal-actions{display:flex;gap:12px;justify-content:center;margin-top:16px}
+.modal-box .btn-confirm{background:var(--green);color:#fff;border:none;padding:8px 20px;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;font-family:var(--font)}
+.modal-box .btn-cancel{background:var(--bg3);color:var(--fg);border:1px solid var(--border);padding:8px 20px;border-radius:6px;font-size:14px;cursor:pointer;font-family:var(--font)}
+.modal-box .btn-confirm:hover,.modal-box .btn-cancel:hover{opacity:0.85}
+.modal-box .modal-status{font-size:12px;color:var(--fg2);margin-top:12px}
+
 /* Footer */
 .footer{text-align:center;color:var(--fg2);font-size:12px;padding:16px 0}
 
@@ -110,6 +129,7 @@ tr.info td{border-left:3px solid var(--blue)}
 <!-- Status Bar -->
 <div class="status-bar">
   <span class="title">Credential Gate</span>
+  <span class="tier-badge" id="tier-badge">—</span>
   <div class="status-item"><span class="dot" id="dot-bw"></span><span id="st-bw">Bitwarden</span></div>
   <div class="status-item"><span class="dot" id="dot-fido"></span><span id="st-fido">FIDO2</span></div>
   <div class="status-item"><span class="dot" id="dot-notif"></span><span id="st-notif">Notifications</span></div>
@@ -173,8 +193,22 @@ tr.info td{border-left:3px solid var(--blue)}
   <tbody id="leases-body"></tbody></table>
 </div>
 
-<div class="footer">Credential Gate &mdash; Phase 11</div>
+<div class="footer">Credential Gate &mdash; Phase 12</div>
 
+</div>
+
+<!-- Elevated Approval Modal -->
+<div class="modal-overlay" id="elevated-modal">
+  <div class="modal-box">
+    <h3 id="elevated-title">Elevated Approval Required</h3>
+    <p>Check your phone for the confirmation code and enter it below.</p>
+    <input type="text" id="elevated-code" maxlength="6" placeholder="000000" autocomplete="off">
+    <div class="modal-actions">
+      <button class="btn-confirm" onclick="submitElevatedCode()">Confirm</button>
+      <button class="btn-cancel" onclick="closeElevatedModal()">Cancel</button>
+    </div>
+    <div class="modal-status" id="elevated-status"></div>
+  </div>
 </div>
 
 <script>
@@ -254,8 +288,19 @@ async function refresh() {
 
   // Status bar
   if (health) {
+    // Tier badge
+    const tier = health.security_tier || "gold";
+    const badge = document.getElementById("tier-badge");
+    badge.textContent = tier === "silver" ? "SILVER \u2014 Phone-Only" : "GOLD \u2014 YubiKey";
+    badge.className = "tier-badge " + tier;
+    window._currentTier = tier;
+
     statusDot("bw", health.bitwarden === "active" ? "green" : "red", "BW: " + health.bitwarden);
-    statusDot("fido", health.fido2 === "ready" ? "green" : "yellow", "FIDO2: " + health.fido2);
+    if (tier === "silver") {
+      statusDot("fido", "yellow", "FIDO2: not required");
+    } else {
+      statusDot("fido", health.fido2 === "ready" ? "green" : "yellow", "FIDO2: " + health.fido2);
+    }
     const nc = health.notifications;
     statusDot("notif", nc === "ntfy_connected" ? "green" : nc === "disabled" ? "yellow" : "red", "Ntfy: " + nc);
     statusDot("mcp", health.mcp === "enabled" ? "green" : "yellow", "MCP: " + health.mcp);
@@ -425,10 +470,55 @@ async function revokeLease(leaseId) {
   } catch (e) { alert("Revoke error: " + e); }
 }
 
+// Elevated approval modal state
+let elevatedRequestId = null;
+let elevatedCallback = null;
+
+function openElevatedModal(title, requestId, onSuccess) {
+  elevatedRequestId = requestId;
+  elevatedCallback = onSuccess;
+  document.getElementById("elevated-title").textContent = title;
+  document.getElementById("elevated-code").value = "";
+  document.getElementById("elevated-status").textContent = "";
+  document.getElementById("elevated-modal").classList.add("visible");
+  document.getElementById("elevated-code").focus();
+}
+
+function closeElevatedModal() {
+  document.getElementById("elevated-modal").classList.remove("visible");
+  elevatedRequestId = null;
+  elevatedCallback = null;
+}
+
+async function submitElevatedCode() {
+  const code = document.getElementById("elevated-code").value.trim();
+  if (!code) { document.getElementById("elevated-status").textContent = "Enter the code from your phone."; return; }
+  document.getElementById("elevated-status").textContent = "Confirming...";
+  try {
+    const r = await fetch(BASE + "/confirm-elevated/" + elevatedRequestId, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({"code": code})
+    });
+    const data = await r.json();
+    if (r.ok && data.status === "confirmed") {
+      closeElevatedModal();
+      if (elevatedCallback) elevatedCallback(data);
+      refresh();
+    } else {
+      document.getElementById("elevated-status").textContent = data.detail || "Invalid code. Try again.";
+    }
+  } catch (e) { document.getElementById("elevated-status").textContent = "Error: " + e; }
+}
+
 async function triggerPanic() {
   const reason = prompt("Panic reason (required):");
   if (!reason) return;
-  if (!confirm("LOCK THE GATE? This will revoke ALL leases and block ALL credential requests.\\n\\nYou will need to touch your YubiKey.")) return;
+  const isSilver = window._currentTier === "silver";
+  const confirmMsg = isSilver
+    ? "LOCK THE GATE? This will revoke ALL leases and block ALL credential requests.\\n\\nA confirmation code will be sent to your phone."
+    : "LOCK THE GATE? This will revoke ALL leases and block ALL credential requests.\\n\\nYou will need to touch your YubiKey.";
+  if (!confirm(confirmMsg)) return;
   try {
     const r = await fetch(BASE + "/panic", {
       method: "POST",
@@ -436,7 +526,12 @@ async function triggerPanic() {
       body: JSON.stringify({"reason": reason})
     });
     const data = await r.json();
-    if (r.ok) {
+    if (r.ok && data.status === "elevated_approval_required") {
+      openElevatedModal("Panic Lock \u2014 Elevated Approval", data.request_id, function() {
+        alert("Gate LOCKED via elevated approval.");
+        refresh();
+      });
+    } else if (r.ok) {
       alert("Gate LOCKED. Leases revoked: " + (data.leases_revoked || 0));
       refresh();
     } else {
@@ -448,7 +543,11 @@ async function triggerPanic() {
 async function triggerUnlock() {
   const reason = prompt("Unlock reason (required):");
   if (!reason) return;
-  if (!confirm("UNLOCK the gate? You will need to touch your YubiKey.")) return;
+  const isSilver = window._currentTier === "silver";
+  const confirmMsg = isSilver
+    ? "UNLOCK the gate? A confirmation code will be sent to your phone."
+    : "UNLOCK the gate? You will need to touch your YubiKey.";
+  if (!confirm(confirmMsg)) return;
   try {
     const r = await fetch(BASE + "/unlock", {
       method: "POST",
@@ -456,7 +555,12 @@ async function triggerUnlock() {
       body: JSON.stringify({"reason": reason})
     });
     const data = await r.json();
-    if (r.ok) {
+    if (r.ok && data.status === "elevated_approval_required") {
+      openElevatedModal("Unlock Gate \u2014 Elevated Approval", data.request_id, function() {
+        alert("Gate UNLOCKED via elevated approval.");
+        refresh();
+      });
+    } else if (r.ok) {
       alert("Gate UNLOCKED. Was locked for " + (data.was_locked_for_seconds || 0) + "s.");
       refresh();
     } else {

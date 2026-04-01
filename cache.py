@@ -8,13 +8,17 @@ Encryption: AES-256-GCM with a key derived from a FIDO2 assertion via
 HKDF.  The encryption key is derived at service startup when the YubiKey
 is present.  If the YubiKey is removed, the cache file is unreadable.
 
+Phase 12 addition: silver tier (phone-only) can derive the cache key
+from a passphrase stored in macOS Keychain instead of a FIDO2 assertion.
+Uses PBKDF2-HMAC-SHA256 with a high iteration count.
+
 Cache entries expire independently of Bitwarden — a cached credential
 has its own TTL (default: 4 hours, configurable per risk level).
 
 Critical credentials are NEVER cached — this is hardcoded and
 non-configurable.
 
-Phase 11 implementation.
+Phase 11 implementation, extended in Phase 12.
 """
 
 import json
@@ -25,6 +29,7 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 
 logger = logging.getLogger(__name__)
@@ -74,6 +79,32 @@ class EncryptedCredentialCache:
         )
         self._encryption_key = hkdf.derive(fido_assertion_result)
         logger.info("Cache encryption key derived from FIDO2 assertion")
+
+        # Try to load existing cache from disk
+        self._read_and_decrypt()
+
+    def derive_key_from_passphrase(self, passphrase: str) -> None:
+        """Derive the cache encryption key from a passphrase (silver tier).
+
+        Used when no YubiKey is present.  The passphrase is the Bitwarden
+        master password retrieved from macOS Keychain — it never leaves
+        memory.
+
+        Uses PBKDF2-HMAC-SHA256 with 600,000 iterations and a fixed salt
+        (the salt is not secret — it just ensures the derived key differs
+        from the Bitwarden key derivation).
+
+        Args:
+            passphrase: The Bitwarden master password from Keychain.
+        """
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b"credential-gate-cache-silver-v1",
+            iterations=600_000,
+        )
+        self._encryption_key = kdf.derive(passphrase.encode("utf-8"))
+        logger.info("Cache encryption key derived from passphrase (silver tier)")
 
         # Try to load existing cache from disk
         self._read_and_decrypt()

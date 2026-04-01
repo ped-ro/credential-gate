@@ -3,6 +3,10 @@
 Uses python-fido2's CTAP2 HID transport directly — no browser involved.
 The Fido2Server handles challenge generation and response verification;
 the Ctap2 client talks to the physical key over USB HID.
+
+Phase 12: All fido2 imports are conditional — when python-fido2 is not
+installed (silver tier / phone-only mode), this module still loads but
+all functions raise RuntimeError with a clear message.
 """
 
 import json
@@ -14,27 +18,44 @@ import threading
 import time
 from pathlib import Path
 
-from fido2.ctap import CtapError
-from fido2.ctap2 import Ctap2
-from fido2.ctap2.pin import ClientPin
-from fido2.hid import CtapHidDevice
-from fido2.server import Fido2Server
-from fido2.webauthn import (
-    AttestedCredentialData,
-    AuthenticatorData,
-    CollectedClientData,
-    PublicKeyCredentialRpEntity,
-    PublicKeyCredentialUserEntity,
-)
+try:
+    from fido2.ctap import CtapError
+    from fido2.ctap2 import Ctap2
+    from fido2.ctap2.pin import ClientPin
+    from fido2.hid import CtapHidDevice
+    from fido2.server import Fido2Server
+    from fido2.webauthn import (
+        AttestedCredentialData,
+        AuthenticatorData,
+        CollectedClientData,
+        PublicKeyCredentialRpEntity,
+        PublicKeyCredentialUserEntity,
+    )
+    FIDO2_AVAILABLE = True
+except ImportError:
+    FIDO2_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _require_fido2():
+    """Raise if python-fido2 is not installed."""
+    if not FIDO2_AVAILABLE:
+        raise RuntimeError(
+            "python-fido2 is not installed. YubiKey features require: "
+            "pip install fido2\n"
+            "For phone-only operation (silver tier), set security_tier: silver "
+            "in config.yaml."
+        )
 
 # ---------------------------------------------------------------------------
 # Device discovery
 # ---------------------------------------------------------------------------
 
-def list_devices() -> list[CtapHidDevice]:
+def list_devices() -> list:
     """Return all connected FIDO2 HID devices."""
+    if not FIDO2_AVAILABLE:
+        return []
     try:
         return list(CtapHidDevice.list_devices())
     except Exception as exc:
@@ -42,8 +63,9 @@ def list_devices() -> list[CtapHidDevice]:
         return []
 
 
-def get_device() -> CtapHidDevice:
+def get_device():
     """Return the first connected FIDO2 device or raise."""
+    _require_fido2()
     devices = list_devices()
     if not devices:
         raise RuntimeError(
@@ -79,8 +101,9 @@ def _save_credentials(path: str, creds: list[dict]) -> None:
         json.dump(creds, f, indent=2)
 
 
-def get_registered_credentials(store_path: str) -> list[AttestedCredentialData]:
+def get_registered_credentials(store_path: str) -> list:
     """Load AttestedCredentialData objects from the credential store."""
+    _require_fido2()
     entries = _load_credentials(store_path)
     result = []
     for entry in entries:
@@ -94,12 +117,12 @@ def get_registered_credentials(store_path: str) -> list[AttestedCredentialData]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_server(rp_id: str, rp_name: str) -> Fido2Server:
+def _build_server(rp_id: str, rp_name: str):
     rp = PublicKeyCredentialRpEntity(id=rp_id, name=rp_name)
     return Fido2Server(rp)
 
 
-def _make_client_data(typ: str, challenge: bytes, origin: str) -> CollectedClientData:
+def _make_client_data(typ: str, challenge: bytes, origin: str):
     """Build a CollectedClientData object for headless use.
 
     The fido2 library's Fido2Server.register_complete / authenticate_complete
@@ -155,7 +178,7 @@ def register(
     rp_name: str,
     store_path: str,
     user_name: str = "credential-gate-admin",
-) -> AttestedCredentialData:
+):
     """Register a new FIDO2 credential on the connected YubiKey.
 
     This is the one-time setup step.  The resulting AttestedCredentialData
@@ -164,6 +187,7 @@ def register(
 
     Returns the AttestedCredentialData for the new credential.
     """
+    _require_fido2()
     device = get_device()
     ctap2 = Ctap2(device)
 
@@ -308,6 +332,7 @@ def assert_touch(
 
     Returns an AssertionResult indicating success or failure.
     """
+    _require_fido2()
     # --- Load registered credentials ---
     credentials = get_registered_credentials(store_path)
     if not credentials:

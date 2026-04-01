@@ -22,6 +22,9 @@ vault them in Bitwarden, track credential ages, and one-click rotation.
 
 Phase 11: Offline resilience — encrypted credential cache, circuit
 breaker for Bitwarden, and crash recovery with graceful degradation.
+
+Phase 12: YubiKey-optional (silver tier) — phone-only mode with
+elevated approval (6-digit confirmation codes) for sensitive operations.
 """
 
 import logging
@@ -38,7 +41,8 @@ from approvals import ApprovalQueue, ApprovalState
 from audit import AuditLog
 from bitwarden import BitwardenError, BitwardenUnavailableError, BitwardenSessionManager, SessionState
 from config import load_config
-from fido import AssertionResult, assert_touch
+from elevated_approval import ElevatedApprovalManager
+from fido import AssertionResult, assert_touch, FIDO2_AVAILABLE
 from leases import LeaseManager, LeaseState, _ts_to_iso
 from panic import PanicManager
 from proxy import ProxyExecutor, ProxyResult, sanitize_output
@@ -49,6 +53,7 @@ from notifications import (
     send_auto_approve_notification,
     send_circuit_breaker_notification,
     send_daily_digest_notification,
+    send_elevated_approval_notification,
     send_identity_violation_notification,
     send_lease_expired_notification,
     send_lease_revoked_notification,
@@ -61,7 +66,7 @@ from notifications import (
     send_touch_notification,
     send_vault_complete_notification,
 )
-from policy import LeasePolicy, load_agent_policy
+from policy import LeasePolicy, load_agent_policy, resolve_approval_mode
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -105,6 +110,10 @@ panic_mgr: PanicManager | None = None
 # Phase 11: Offline + Resilience
 credential_cache = None  # type: ignore
 circuit_breaker = None  # type: ignore
+
+# Phase 12: Security tier + elevated approval
+security_tier: str = "gold"
+elevated_mgr: ElevatedApprovalManager | None = None
 
 
 @asynccontextmanager
@@ -170,6 +179,33 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Observability disabled (set observability.enabled: true to enable)")
 
+    # Phase 12: Determine security tier
+    global security_tier, elevated_mgr
+    security_tier = cfg.get("security_tier", "gold")
+
+    # Validate tier — silver requires notifications for elevated approval
+    if security_tier == "silver":
+        if not FIDO2_AVAILABLE:
+            logger.info("Silver tier: python-fido2 not installed (OK for phone-only mode)")
+        if not _notifications_enabled():
+            logger.warning(
+                "Silver tier requires notifications for elevated approval — "
+                "enable notifications in config.yaml"
+            )
+        elevated_mgr = ElevatedApprovalManager(cfg)
+        logger.info("Elevated approval manager initialized (silver tier)")
+    elif security_tier == "gold":
+        if not FIDO2_AVAILABLE:
+            logger.error(
+                "Gold tier requires python-fido2. Install it: pip install fido2\n"
+                "Or switch to silver tier: security_tier: silver"
+            )
+    else:
+        logger.warning("Unknown security_tier '%s', defaulting to gold", security_tier)
+        security_tier = "gold"
+
+    logger.info("Security tier: %s", security_tier.upper())
+
     # Initialize panic manager (Phase 10)
     global panic_mgr
     data_dir = str(Path(cfg["audit"]["db_path"]).parent)
@@ -179,6 +215,7 @@ async def lifespan(app: FastAPI):
         notifier_config=cfg,
         audit=audit_log,
         data_dir=data_dir,
+        security_tier=security_tier,
     )
     panic_cfg = cfg.get("panic", {})
     cooldown = panic_cfg.get("cooldown_after_unlock_seconds", 60)
@@ -198,47 +235,60 @@ async def lifespan(app: FastAPI):
 
         circuit_breaker = BitwardenCircuitBreaker(cfg, notifier=cfg)
 
-        # Derive cache encryption key from YubiKey
-        try:
-            from fido import get_device, get_registered_credentials
+        # Derive cache encryption key (tier-dependent)
+        if security_tier == "gold":
+            # Gold: derive from YubiKey FIDO2 assertion
+            try:
+                from fido import get_device, get_registered_credentials
 
-            fido2_cfg = cfg.get("fido2", {})
-            store = fido2_cfg.get("credential_store", "")
-            creds = get_registered_credentials(store)
-            if creds:
-                device = get_device()
-                if device:
-                    from fido2.client import Fido2Client, UserInteraction
-                    from fido2.server import Fido2Server
+                fido2_cfg = cfg.get("fido2", {})
+                store = fido2_cfg.get("credential_store", "")
+                creds = get_registered_credentials(store)
+                if creds:
+                    device = get_device()
+                    if device:
+                        from fido2.client import Fido2Client, UserInteraction
+                        from fido2.server import Fido2Server
 
-                    rp_id = fido2_cfg.get("rp_id", "credential-gate.local")
-                    rp_name = fido2_cfg.get("rp_name", "Credential Gate")
-                    server = Fido2Server({"id": rp_id, "name": rp_name})
+                        rp_id = fido2_cfg.get("rp_id", "credential-gate.local")
+                        rp_name = fido2_cfg.get("rp_name", "Credential Gate")
+                        server = Fido2Server({"id": rp_id, "name": rp_name})
 
-                    class _NoPrompt(UserInteraction):
-                        def prompt_up(self):
-                            print("\n  >>> Touch YubiKey to derive cache encryption key <<<\n")
-                        def request_pin(self, permissions, rd_id):
-                            return None
-                        def request_uv(self, permissions, rd_id):
-                            return True
+                        class _NoPrompt(UserInteraction):
+                            def prompt_up(self):
+                                print("\n  >>> Touch YubiKey to derive cache encryption key <<<\n")
+                            def request_pin(self, permissions, rd_id):
+                                return None
+                            def request_uv(self, permissions, rd_id):
+                                return True
 
-                    client = Fido2Client(device, f"https://{rp_id}", user_interaction=_NoPrompt())
-                    options, state = server.authenticate_begin(creds)
-                    result = client.get_assertion(options)
-                    response = result.get_response(0)
-                    server.authenticate_complete(state, creds, response)
+                        client = Fido2Client(device, f"https://{rp_id}", user_interaction=_NoPrompt())
+                        options, state = server.authenticate_begin(creds)
+                        result = client.get_assertion(options)
+                        response = result.get_response(0)
+                        server.authenticate_complete(state, creds, response)
 
-                    # Use authenticator_data + signature as key material
-                    key_material = response.authenticator_data + response.signature
-                    credential_cache.derive_key(key_material)
-                    logger.info("Offline cache initialized (key derived from YubiKey)")
+                        # Use authenticator_data + signature as key material
+                        key_material = response.authenticator_data + response.signature
+                        credential_cache.derive_key(key_material)
+                        logger.info("Offline cache initialized (key derived from YubiKey)")
+                    else:
+                        logger.warning("No YubiKey detected — offline cache NOT initialized")
                 else:
-                    logger.warning("No YubiKey detected — offline cache NOT initialized")
-            else:
-                logger.warning("No FIDO2 credentials registered — offline cache NOT initialized")
-        except Exception as e:
-            logger.warning("Failed to initialize offline cache key: %s", e)
+                    logger.warning("No FIDO2 credentials registered — offline cache NOT initialized")
+            except Exception as e:
+                logger.warning("Failed to initialize offline cache key: %s", e)
+        else:
+            # Silver: derive from Bitwarden master password in Keychain
+            try:
+                password = bw.get_master_password_from_keychain() if bw else None
+                if password:
+                    credential_cache.derive_key_from_passphrase(password)
+                    logger.info("Offline cache initialized (key derived from Keychain passphrase, silver tier)")
+                else:
+                    logger.warning("No Keychain password — offline cache NOT initialized (silver tier)")
+            except Exception as e:
+                logger.warning("Failed to initialize offline cache key (silver tier): %s", e)
 
         logger.info("Circuit breaker enabled (threshold=%d, recovery=%ds)",
             offline_cfg.get("circuit_breaker", {}).get("failure_threshold", 3),
@@ -301,9 +351,10 @@ async def lifespan(app: FastAPI):
 
     mode = cfg.get("authorization", {}).get("mode", "yubikey")
     logger.info(
-        "Credential Gate started on %s:%s (mode=%s)",
+        "Credential Gate started on %s:%s (tier=%s, mode=%s)",
         cfg["server"]["host"],
         cfg["server"]["port"],
+        security_tier,
         mode,
     )
     yield
@@ -351,6 +402,10 @@ def _notifications_enabled() -> bool:
 
 def _auth_mode() -> str:
     return cfg.get("authorization", {}).get("mode", "yubikey")
+
+
+def _is_silver_tier() -> bool:
+    return security_tier == "silver"
 
 
 def _validate_agent_identity(request: Request, agent_id: str) -> None:
@@ -483,11 +538,12 @@ async def health():
     fido2_cfg = cfg.get("fido2", {})
     store = fido2_cfg.get("credential_store", "")
     has_creds = False
-    try:
-        from fido import get_registered_credentials
-        has_creds = len(get_registered_credentials(store)) > 0
-    except Exception:
-        pass
+    if FIDO2_AVAILABLE and security_tier == "gold":
+        try:
+            from fido import get_registered_credentials
+            has_creds = len(get_registered_credentials(store)) > 0
+        except Exception:
+            pass
 
     # Bitwarden session status
     bw_status = "unknown"
@@ -554,10 +610,19 @@ async def health():
     else:
         overall_status = "degraded"
 
+    # Phase 12: FIDO2 status depends on tier
+    if security_tier == "silver":
+        fido2_status = "not_required (silver tier)"
+    elif has_creds:
+        fido2_status = "ready"
+    else:
+        fido2_status = "no_credentials"
+
     return {
         "status": overall_status,
+        "security_tier": security_tier,
         "bitwarden": bw_status,
-        "fido2": "ready" if has_creds else "no_credentials",
+        "fido2": fido2_status,
         "authorization_mode": _auth_mode(),
         "notifications": notif_status,
         "mcp": mcp_status,
@@ -714,33 +779,58 @@ class PanicRequest(BaseModel):
 async def trigger_panic(req: PanicRequest, request: Request):
     """Emergency lockdown. Revokes all leases and blocks all credential access.
 
-    Requires YubiKey ONLY — no phone approval for panic (phone could be
-    compromised). Overrides any policy — panic always works regardless of
-    schedule, rate limits, etc.
+    Gold tier: requires YubiKey ONLY (phone could be compromised).
+    Silver tier: requires elevated phone approval (6-digit code).
+    Overrides any policy — panic always works regardless of schedule, rate limits, etc.
     """
     if not panic_mgr:
         raise HTTPException(status_code=503, detail="Panic manager not initialized")
 
     logger.critical("PANIC requested: %s", req.reason)
-    print(
-        f"\n{'='*60}\n"
-        f"  EMERGENCY LOCKDOWN REQUEST\n"
-        f"  Reason:           {req.reason}\n"
-        f"  Rotate creds:     {req.rotate_credentials}\n"
-        f"  Agent filter:     {req.agent_filter or 'ALL'}\n"
-        f"{'='*60}\n"
-        f"  >>> Touch your YubiKey to LOCK THE GATE\n"
-    )
 
-    result = _run_fido2_assertion()
-    if not result.success:
-        audit_log.log(
+    if _is_silver_tier():
+        # Silver tier: elevated phone approval
+        elevated_result = _start_elevated_approval(
             agent_id="admin",
             credential_name="*",
-            status="denied",
-            purpose=f"panic_attempt: {req.reason}",
+            purpose=req.reason,
+            operation="panic_lock",
         )
-        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+        return {
+            "status": "elevated_approval_required",
+            "request_id": elevated_result["request_id"],
+            "message": (
+                "Elevated approval required. A 6-digit code has been sent to your phone. "
+                "POST to /confirm-elevated/{request_id} with {\"code\": \"...\"} to confirm."
+            ),
+            "pending_action": {
+                "action": "panic",
+                "reason": req.reason,
+                "rotate_credentials": req.rotate_credentials,
+                "agent_filter": req.agent_filter,
+            },
+        }
+    else:
+        # Gold tier: YubiKey
+        print(
+            f"\n{'='*60}\n"
+            f"  EMERGENCY LOCKDOWN REQUEST\n"
+            f"  Reason:           {req.reason}\n"
+            f"  Rotate creds:     {req.rotate_credentials}\n"
+            f"  Agent filter:     {req.agent_filter or 'ALL'}\n"
+            f"{'='*60}\n"
+            f"  >>> Touch your YubiKey to LOCK THE GATE\n"
+        )
+
+        result = _run_fido2_assertion()
+        if not result.success:
+            audit_log.log(
+                agent_id="admin",
+                credential_name="*",
+                status="denied",
+                purpose=f"panic_attempt: {req.reason}",
+            )
+            raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
 
     summary = await panic_mgr.panic(
         reason=req.reason,
@@ -758,7 +848,8 @@ class UnlockRequest(BaseModel):
 async def unlock_gate(req: UnlockRequest, request: Request):
     """Unlock the gate after a panic lockdown.
 
-    Requires YubiKey ONLY. Cannot be done via phone.
+    Gold tier: requires YubiKey ONLY.
+    Silver tier: requires elevated phone approval (6-digit code).
     """
     if not panic_mgr:
         raise HTTPException(status_code=503, detail="Panic manager not initialized")
@@ -767,23 +858,46 @@ async def unlock_gate(req: UnlockRequest, request: Request):
         return {"status": "already_unlocked", "message": "Gate is not locked"}
 
     logger.info("Unlock requested: %s", req.reason)
-    print(
-        f"\n{'='*60}\n"
-        f"  GATE UNLOCK REQUEST\n"
-        f"  Reason: {req.reason}\n"
-        f"{'='*60}\n"
-        f"  >>> Touch your YubiKey to UNLOCK\n"
-    )
 
-    result = _run_fido2_assertion()
-    if not result.success:
-        audit_log.log(
+    if _is_silver_tier():
+        # Silver tier: elevated phone approval
+        elevated_result = _start_elevated_approval(
             agent_id="admin",
             credential_name="*",
-            status="denied",
-            purpose=f"unlock_attempt: {req.reason}",
+            purpose=req.reason,
+            operation="panic_unlock",
         )
-        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+        return {
+            "status": "elevated_approval_required",
+            "request_id": elevated_result["request_id"],
+            "message": (
+                "Elevated approval required. A 6-digit code has been sent to your phone. "
+                "POST to /confirm-elevated/{request_id} with {\"code\": \"...\"} to confirm."
+            ),
+            "pending_action": {
+                "action": "unlock",
+                "reason": req.reason,
+            },
+        }
+    else:
+        # Gold tier: YubiKey
+        print(
+            f"\n{'='*60}\n"
+            f"  GATE UNLOCK REQUEST\n"
+            f"  Reason: {req.reason}\n"
+            f"{'='*60}\n"
+            f"  >>> Touch your YubiKey to UNLOCK\n"
+        )
+
+        result = _run_fido2_assertion()
+        if not result.success:
+            audit_log.log(
+                agent_id="admin",
+                credential_name="*",
+                status="denied",
+                purpose=f"unlock_attempt: {req.reason}",
+            )
+            raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
 
     summary = await panic_mgr.unlock(reason=req.reason)
     return summary
@@ -798,6 +912,95 @@ async def get_lock_status():
     if not panic_mgr:
         return {"locked": False}
     return panic_mgr.get_status()
+
+
+# ---------------------------------------------------------------------------
+# Tier info endpoint (Phase 12)
+# ---------------------------------------------------------------------------
+
+@app.get("/tier")
+async def get_tier():
+    """Return the security tier and its implications."""
+    tier_info = {
+        "security_tier": security_tier,
+        "fido2_available": FIDO2_AVAILABLE,
+        "fido2_required": security_tier == "gold",
+        "elevated_approval_enabled": security_tier == "silver",
+    }
+    if security_tier == "silver":
+        ea_cfg = cfg.get("elevated_approval", {})
+        tier_info["elevated_approval"] = {
+            "timeout_seconds": ea_cfg.get("timeout_seconds", 120),
+            "code_length": ea_cfg.get("code_length", 6),
+        }
+    return tier_info
+
+
+# ---------------------------------------------------------------------------
+# Elevated approval endpoints (Phase 12 — silver tier)
+# ---------------------------------------------------------------------------
+
+class ElevatedConfirmRequest(BaseModel):
+    code: str
+
+
+@app.post("/confirm-elevated/{request_id}")
+async def confirm_elevated(request_id: str, body: ElevatedConfirmRequest):
+    """Confirm an elevated approval request with the 6-digit code.
+
+    Silver tier only.  The code was sent via push notification.
+    After confirmation, the pending operation is executed.
+    """
+    if not elevated_mgr:
+        raise HTTPException(status_code=404, detail="Elevated approval not enabled (gold tier)")
+
+    result = elevated_mgr.confirm(request_id, body.code)
+    if not result["confirmed"]:
+        reason = result.get("reason", "unknown")
+        logger.warning(
+            "Elevated approval failed: request_id=%s reason=%s",
+            request_id[:12], reason,
+        )
+        audit_log.log(
+            agent_id="admin",
+            credential_name="*",
+            status="denied",
+            purpose=f"elevated_confirm_failed: {reason}",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Elevated approval failed: {reason}",
+        )
+
+    logger.info("Elevated approval confirmed: %s", request_id[:12])
+    audit_log.log(
+        agent_id="admin",
+        credential_name="*",
+        status="elevated_confirmed",
+        purpose=f"elevated_confirmed: {request_id[:12]}",
+    )
+    return {"status": "confirmed", "request_id": request_id}
+
+
+@app.get("/elevated/{request_id}")
+async def get_elevated_status(request_id: str):
+    """Check the status of an elevated approval request."""
+    if not elevated_mgr:
+        raise HTTPException(status_code=404, detail="Elevated approval not enabled")
+
+    pending = elevated_mgr.get_pending(request_id)
+    if not pending:
+        return {"status": "not_found_or_completed"}
+
+    import time as _time
+    remaining = max(0, int(pending.expires_at - _time.time()))
+    return {
+        "status": "pending",
+        "operation": pending.operation,
+        "agent_id": pending.agent_id,
+        "credential_name": pending.credential_name,
+        "remaining_seconds": remaining,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +1042,8 @@ class ScanResponse(BaseModel):
 async def scan_for_secrets(req: ScanRequest, request: Request):
     """Scan a directory for hardcoded secrets.
 
-    Requires YubiKey approval (scan results are sensitive).
+    Gold tier: requires YubiKey approval (scan results are sensitive).
+    Silver tier: requires elevated phone approval (6-digit code).
     The response NEVER includes raw secret values — only masked versions.
     """
     global _last_scan_findings, _last_scan_time
@@ -847,26 +1051,47 @@ async def scan_for_secrets(req: ScanRequest, request: Request):
     if not secret_scanner:
         raise HTTPException(status_code=404, detail="Discovery not enabled")
 
-    # Always require YubiKey for scans
-    logger.info("Secret scan requested for '%s' — awaiting YubiKey touch", req.path)
-    print(
-        f"\n{'='*60}\n"
-        f"  SECRET SCAN REQUEST\n"
-        f"  Path:      {req.path}\n"
-        f"  Recursive: {req.recursive}\n"
-        f"{'='*60}\n"
-        f"  >>> Touch your YubiKey to approve\n"
-    )
+    logger.info("Secret scan requested for '%s'", req.path)
 
-    result = _run_fido2_assertion()
-    if not result.success:
-        audit_log.log(
+    if _is_silver_tier():
+        elevated_result = _start_elevated_approval(
             agent_id="admin",
             credential_name="secret_scan",
-            status="denied",
             purpose=f"scan:{req.path}",
+            operation="secret_scan",
         )
-        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+        return ScanResponse(
+            files_scanned=0,
+            findings_count=0,
+            by_severity={},
+            findings=[{
+                "status": "elevated_approval_required",
+                "request_id": elevated_result["request_id"],
+                "message": (
+                    "Elevated approval required. Confirm the 6-digit code sent to your phone "
+                    "at POST /confirm-elevated/{request_id}, then retry the scan."
+                ),
+            }],
+        )
+    else:
+        print(
+            f"\n{'='*60}\n"
+            f"  SECRET SCAN REQUEST\n"
+            f"  Path:      {req.path}\n"
+            f"  Recursive: {req.recursive}\n"
+            f"{'='*60}\n"
+            f"  >>> Touch your YubiKey to approve\n"
+        )
+
+        result = _run_fido2_assertion()
+        if not result.success:
+            audit_log.log(
+                agent_id="admin",
+                credential_name="secret_scan",
+                status="denied",
+                purpose=f"scan:{req.path}",
+            )
+            raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
 
     # Run the scan
     findings, files_scanned = secret_scanner.scan_directory(
@@ -935,21 +1160,37 @@ async def vault_finding(req: VaultRequest, request: Request):
             detail=f"finding_index {req.finding_index} out of range (0-{len(_last_scan_findings) - 1})",
         )
 
-    # Require approval
-    mode = _auth_mode()
-    logger.info("Vault-finding requested — awaiting approval (mode=%s)", mode)
-    print(
-        f"\n{'='*60}\n"
-        f"  VAULT FINDING\n"
-        f"  Finding:   #{req.finding_index}\n"
-        f"  Mode:      {mode}\n"
-        f"{'='*60}\n"
-        f"  >>> Touch your YubiKey to approve\n"
-    )
+    # Require approval (tier-aware)
+    if _is_silver_tier():
+        elevated_result = _start_elevated_approval(
+            agent_id="admin",
+            credential_name="vault_finding",
+            purpose=f"vault finding #{req.finding_index}",
+            operation="vault_finding",
+        )
+        return {
+            "status": "elevated_approval_required",
+            "request_id": elevated_result["request_id"],
+            "message": (
+                "Elevated approval required. Confirm the 6-digit code sent to your phone "
+                "at POST /confirm-elevated/{request_id}, then retry."
+            ),
+        }
+    else:
+        mode = _auth_mode()
+        logger.info("Vault-finding requested — awaiting approval (mode=%s)", mode)
+        print(
+            f"\n{'='*60}\n"
+            f"  VAULT FINDING\n"
+            f"  Finding:   #{req.finding_index}\n"
+            f"  Mode:      {mode}\n"
+            f"{'='*60}\n"
+            f"  >>> Touch your YubiKey to approve\n"
+        )
 
-    result = _run_fido2_assertion()
-    if not result.success:
-        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+        result = _run_fido2_assertion()
+        if not result.success:
+            raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
 
     finding = _last_scan_findings[req.finding_index]
     vault_result = await auto_vaulter.vault_finding(
@@ -1006,19 +1247,35 @@ async def vault_batch(req: VaultBatchRequest, request: Request):
     if not eligible:
         return {"total": 0, "created": 0, "skipped": 0, "failed": 0, "results": []}
 
-    # YubiKey required for batch operations
-    logger.info("Vault-batch requested (%d findings) — awaiting YubiKey touch", len(eligible))
-    print(
-        f"\n{'='*60}\n"
-        f"  VAULT BATCH\n"
-        f"  Findings:  {len(eligible)} (>= {req.severity_filter})\n"
-        f"{'='*60}\n"
-        f"  >>> Touch your YubiKey to approve\n"
-    )
+    # Approval required (tier-aware)
+    if _is_silver_tier():
+        elevated_result = _start_elevated_approval(
+            agent_id="admin",
+            credential_name="vault_batch",
+            purpose=f"vault {len(eligible)} findings (>= {req.severity_filter})",
+            operation="vault_batch",
+        )
+        return {
+            "status": "elevated_approval_required",
+            "request_id": elevated_result["request_id"],
+            "message": (
+                "Elevated approval required. Confirm the 6-digit code sent to your phone "
+                "at POST /confirm-elevated/{request_id}, then retry."
+            ),
+        }
+    else:
+        logger.info("Vault-batch requested (%d findings) — awaiting YubiKey touch", len(eligible))
+        print(
+            f"\n{'='*60}\n"
+            f"  VAULT BATCH\n"
+            f"  Findings:  {len(eligible)} (>= {req.severity_filter})\n"
+            f"{'='*60}\n"
+            f"  >>> Touch your YubiKey to approve\n"
+        )
 
-    result = _run_fido2_assertion()
-    if not result.success:
-        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+        result = _run_fido2_assertion()
+        if not result.success:
+            raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
 
     batch_result = await auto_vaulter.vault_batch(eligible, collection_id=req.collection_id)
 
@@ -1065,25 +1322,44 @@ async def rotate_credential(credential_name: str, request: Request):
     # Determine credential type from pattern (best guess from name)
     credential_type = _guess_credential_type(credential_name)
 
-    logger.info("Rotation requested for '%s' (type=%s) — awaiting YubiKey touch", credential_name, credential_type)
-    print(
-        f"\n{'='*60}\n"
-        f"  CREDENTIAL ROTATION\n"
-        f"  Credential: {credential_name}\n"
-        f"  Type:       {credential_type}\n"
-        f"{'='*60}\n"
-        f"  >>> Touch your YubiKey to approve\n"
-    )
+    logger.info("Rotation requested for '%s' (type=%s)", credential_name, credential_type)
 
-    result = _run_fido2_assertion()
-    if not result.success:
-        audit_log.log(
+    if _is_silver_tier():
+        elevated_result = _start_elevated_approval(
             agent_id="admin",
             credential_name=credential_name,
-            status="denied",
             purpose=f"rotate:{credential_name}",
+            operation="credential_rotation",
         )
-        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+        return {
+            "status": "elevated_approval_required",
+            "request_id": elevated_result["request_id"],
+            "message": (
+                "Elevated approval required. Confirm the 6-digit code sent to your phone "
+                "at POST /confirm-elevated/{request_id}, then retry."
+            ),
+            "credential_name": credential_name,
+            "rotation_type": credential_type,
+        }
+    else:
+        print(
+            f"\n{'='*60}\n"
+            f"  CREDENTIAL ROTATION\n"
+            f"  Credential: {credential_name}\n"
+            f"  Type:       {credential_type}\n"
+            f"{'='*60}\n"
+            f"  >>> Touch your YubiKey to approve\n"
+        )
+
+        result = _run_fido2_assertion()
+        if not result.success:
+            audit_log.log(
+                agent_id="admin",
+                credential_name=credential_name,
+                status="denied",
+                purpose=f"rotate:{credential_name}",
+            )
+            raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
 
     rotation_result = await credential_rotator.rotate(credential_name, credential_type)
 
@@ -1216,6 +1492,13 @@ def _lease_expiry_daemon():
                 logger.warning("Circuit breaker has been OPEN for too long")
         except Exception as e:
             logger.error("Circuit breaker check error: %s", e)
+
+        # Phase 12: Cleanup expired elevated approval requests
+        try:
+            if elevated_mgr:
+                elevated_mgr.cleanup_expired()
+        except Exception as e:
+            logger.error("Elevated approval cleanup error: %s", e)
 
         _expiry_stop.wait(30)
     logger.info("Lease expiry daemon stopped")
@@ -1544,20 +1827,40 @@ async def revoke_all_leases(
     body: RevokeAllRequest,
     request: Request,
 ):
-    """Revoke all active leases. Requires YubiKey touch (safety-critical)."""
-    # This is a dangerous operation — require YubiKey
-    logger.warning("Revoke-all requested — awaiting YubiKey touch")
-    print(
-        f"\n{'='*60}\n"
-        f"  REVOKE ALL LEASES\n"
-        f"  Scope: {body.agent_id or 'ALL AGENTS'}\n"
-        f"{'='*60}\n"
-        f"  >>> Touch your YubiKey to confirm\n"
-    )
+    """Revoke all active leases.
 
-    result = _run_fido2_assertion()
-    if not result.success:
-        raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
+    Gold tier: requires YubiKey touch (safety-critical).
+    Silver tier: requires elevated phone approval.
+    """
+    logger.warning("Revoke-all requested")
+
+    if _is_silver_tier():
+        elevated_result = _start_elevated_approval(
+            agent_id="admin",
+            credential_name="*",
+            purpose=f"revoke all leases (scope: {body.agent_id or 'ALL'})",
+            operation="revoke_all",
+        )
+        return {
+            "status": "elevated_approval_required",
+            "request_id": elevated_result["request_id"],
+            "message": (
+                "Elevated approval required. Confirm the 6-digit code sent to your phone "
+                "at POST /confirm-elevated/{request_id}, then retry."
+            ),
+        }
+    else:
+        print(
+            f"\n{'='*60}\n"
+            f"  REVOKE ALL LEASES\n"
+            f"  Scope: {body.agent_id or 'ALL AGENTS'}\n"
+            f"{'='*60}\n"
+            f"  >>> Touch your YubiKey to confirm\n"
+        )
+
+        result = _run_fido2_assertion()
+        if not result.success:
+            raise HTTPException(status_code=403, detail=f"YubiKey assertion failed: {result.error}")
 
     count = lease_mgr.revoke_all(agent_id=body.agent_id)
 
@@ -1760,6 +2063,9 @@ async def execute_proxy(
         policy_checks = None
         lease_pol = LeasePolicy()
 
+    # Phase 12: Resolve approval mode for security tier
+    mode = resolve_approval_mode(mode, security_tier)
+
     # --- Build a CredentialRequest for the approval flow ---
     cred_req = CredentialRequest(
         agent_id=req.agent_id,
@@ -1884,6 +2190,67 @@ def _run_fido2_assertion() -> AssertionResult:
         store_path=fido2_cfg.get("credential_store"),
         timeout_seconds=timeout,
     )
+
+
+def _start_elevated_approval(
+    agent_id: str,
+    credential_name: str,
+    purpose: str,
+    operation: str,
+) -> dict:
+    """Start an elevated approval flow (silver tier).
+
+    Creates a pending request, generates a 6-digit code, and sends it
+    via push notification.  Returns a dict with the request_id.
+
+    Raises HTTPException if elevated approval is not available.
+    """
+    if not elevated_mgr:
+        raise HTTPException(
+            status_code=503,
+            detail="Elevated approval not available. Check config.",
+        )
+
+    req = elevated_mgr.create_request(
+        agent_id=agent_id,
+        credential_name=credential_name,
+        purpose=purpose,
+        operation=operation,
+    )
+
+    # Send the code via push notification
+    ea_cfg = cfg.get("elevated_approval", {})
+    timeout_seconds = ea_cfg.get("timeout_seconds", 120)
+
+    if _notifications_enabled():
+        send_elevated_approval_notification(
+            config=cfg,
+            code=req.code,
+            agent_id=agent_id,
+            credential_name=credential_name,
+            operation=operation,
+            purpose=purpose,
+            timeout_seconds=timeout_seconds,
+        )
+    else:
+        # If notifications aren't enabled, print code to console as fallback
+        print(
+            f"\n{'='*60}\n"
+            f"  ELEVATED APPROVAL CODE\n"
+            f"  Operation:   {operation}\n"
+            f"  Agent:       {agent_id}\n"
+            f"  Credential:  {credential_name}\n"
+            f"  Code:        {req.code}\n"
+            f"  Expires in:  {timeout_seconds}s\n"
+            f"{'='*60}\n"
+        )
+
+    logger.info(
+        "Elevated approval started: op=%s request_id=%s (timeout=%ds)",
+        operation, req.request_id[:12], timeout_seconds,
+    )
+
+    return {"request_id": req.request_id}
 
 
 def _fetch_credential(req: CredentialRequest) -> dict:
@@ -2029,9 +2396,12 @@ async def request_credential(
         alert_always = False
         policy_checks = None
 
+    # Phase 12: Resolve approval mode for security tier
+    mode = resolve_approval_mode(mode, security_tier)
+
     logger.info(
-        "Credential request [mode=%s]: %s requests '%s' for '%s'",
-        mode, req.agent_id, req.credential_name, req.purpose,
+        "Credential request [tier=%s, mode=%s]: %s requests '%s' for '%s'",
+        security_tier, mode, req.agent_id, req.credential_name, req.purpose,
     )
     _print_request_banner(req, mode)
 

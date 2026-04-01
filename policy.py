@@ -525,3 +525,26 @@ def validate_policy_file(path: Path) -> list[str]:
                 errors.append(f"Credential '{cred_name}': rotate_on_expire must be a boolean")
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Phase 12: Tier-aware approval mode resolution
+# ---------------------------------------------------------------------------
+
+# Mapping: when silver tier encounters a YubiKey-requiring mode, what to use.
+_SILVER_MODE_MAP = {
+    "yubikey": "phone",
+    "both": "phone",
+    "phone": "phone",
+}
+
+
+def resolve_approval_mode(mode: str, security_tier: str) -> str:
+    """Resolve the effective approval mode based on security tier.
+
+    Gold tier: mode is used as-is.
+    Silver tier: any mode referencing YubiKey is downgraded to phone.
+    """
+    if security_tier == "gold":
+        return mode
+    return _SILVER_MODE_MAP.get(mode, "phone")

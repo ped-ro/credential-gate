@@ -867,6 +867,78 @@ def send_offline_serve_notification(
         return False
 
 
+def send_elevated_approval_notification(
+    config: dict,
+    code: str,
+    agent_id: str,
+    credential_name: str,
+    operation: str,
+    purpose: str,
+    timeout_seconds: int,
+) -> bool:
+    """Send elevated-approval notification with 6-digit confirmation code.
+
+    Used in silver tier (phone-only) for operations that would normally
+    require YubiKey (panic, scan, rotate, high-risk credentials).
+
+    The code is displayed in the notification body — the user must type
+    it back at /confirm-elevated/{request_id} to confirm. No action buttons
+    are included; the user must read and manually confirm.
+
+    Priority: max (5). Tags: lock, key.
+    Never raises.
+    """
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        purpose_text = f"\nPurpose: {purpose}" if purpose else ""
+        message = (
+            f"ELEVATED APPROVAL REQUIRED\n"
+            f"\n"
+            f"Operation: {operation}\n"
+            f"Agent: {agent_id}\n"
+            f"Credential: {credential_name}{purpose_text}\n"
+            f"\n"
+            f"Confirmation code:\n"
+            f"\n"
+            f"  {code}\n"
+            f"\n"
+            f"Enter this code within {timeout_seconds}s to approve.\n"
+            f"Ignore this message to deny."
+        )
+
+        headers = {
+            "Title": "Credential Gate \u2014 Elevated Approval",
+            "Priority": "max",
+            "Tags": "lock,key",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info(
+                    "Elevated approval notification sent for '%s' (op=%s)",
+                    credential_name,
+                    operation,
+                )
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for elevated approval", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send elevated approval notification: %s", e)
+        return False
+
+
 def test_ntfy(config: dict) -> bool:
     """Send a test notification to verify Ntfy connectivity.
 

@@ -356,6 +356,10 @@ class BitwardenSessionManager:
         """Retrieve the Bitwarden master password from macOS Keychain."""
         return keychain_retrieve(self._keychain_service, self._keychain_account)
 
+    def get_master_password_from_keychain(self) -> str | None:
+        """Public accessor for the Keychain password (Phase 12: silver tier cache key)."""
+        return self._get_password_from_keychain()
+
     def _do_unlock(self) -> bool:
         """Attempt to unlock using the Keychain-stored password.
 

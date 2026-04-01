@@ -3,12 +3,13 @@
 When something goes wrong — compromised agent, suspicious activity, breach
 detected — the gate can be instantly locked.  All active leases are revoked,
 new credential requests are blocked, and the gate stays locked until Pete
-explicitly unlocks it with YubiKey.
+explicitly unlocks it with YubiKey (gold tier) or elevated phone approval
+(silver tier).
 
 Lock state is persisted to data/lock.json so a service restart during an
 incident does not accidentally unlock the gate.
 
-Phase 10 implementation.
+Phase 10 implementation, extended in Phase 12 for tier awareness.
 """
 
 import json
@@ -34,13 +35,15 @@ class PanicManager:
     — no policy evaluation, no Bitwarden call, nothing.
     """
 
-    def __init__(self, lease_manager, bitwarden, notifier_config, audit, data_dir: str):
+    def __init__(self, lease_manager, bitwarden, notifier_config, audit, data_dir: str,
+                 security_tier: str = "gold"):
         self._lease_mgr = lease_manager
         self._bw = bitwarden
         self._notifier_config = notifier_config
         self._audit = audit
         self._credential_cache = None
         self._lock_file = Path(data_dir) / "lock.json"
+        self._security_tier = security_tier
 
         # In-memory state
         self._locked = False
@@ -73,7 +76,12 @@ class PanicManager:
             "locked_for_seconds": int(time.time() - self._lock_time) if self._lock_time else 0,
             "message": (
                 "Credential Gate is in panic lockdown. "
-                "No credentials will be issued. YubiKey required to unlock."
+                "No credentials will be issued. "
+                + (
+                    "YubiKey required to unlock."
+                    if self._security_tier == "gold"
+                    else "Elevated phone approval required to unlock."
+                )
             ),
         }
 

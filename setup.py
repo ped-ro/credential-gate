@@ -7,6 +7,7 @@ Usage:
     python setup.py check            Verify device, config, and service status
     python setup.py store-password   Store Bitwarden master password in Keychain
     python setup.py test-ntfy        Send a test notification via Ntfy
+    python setup.py test-phone       Test phone approval flow end-to-end
 """
 
 import getpass
@@ -18,9 +19,25 @@ from config import load_config
 
 def cmd_register():
     """Register a YubiKey with the Credential Gate service."""
-    from fido import register, list_devices
+    from fido import FIDO2_AVAILABLE
 
     cfg = load_config()
+
+    # Phase 12: Check tier before registration
+    tier = cfg.get("security_tier", "gold")
+    if tier == "silver":
+        print("Security tier is 'silver' (phone-only mode).")
+        print("YubiKey registration is not needed for silver tier.")
+        print("If you want to use a YubiKey, set security_tier: gold in config.yaml.")
+        sys.exit(0)
+
+    if not FIDO2_AVAILABLE:
+        print("ERROR: python-fido2 is not installed.")
+        print("Install it: pip install fido2")
+        print("Or use silver tier (phone-only): set security_tier: silver in config.yaml.")
+        sys.exit(1)
+
+    from fido import register, list_devices
     fido2_cfg = cfg.get("fido2", {})
 
     print("Credential Gate — YubiKey Registration")
@@ -72,29 +89,41 @@ def cmd_check():
     import shutil
 
     from bitwarden import keychain_retrieve
+    from fido import FIDO2_AVAILABLE
 
     cfg = load_config()
+
+    # Phase 12: Security tier
+    tier = cfg.get("security_tier", "gold")
 
     print("Credential Gate — Pre-flight Check")
     print("=" * 40)
 
     # Python
     print(f"\nPython: {sys.version.split()[0]}")
+    print(f"Security tier: {tier.upper()}")
 
-    # FIDO2 devices
-    from fido import list_devices, get_registered_credentials
-    devices = list_devices()
-    if devices:
-        dev = devices[0]
-        print(f"YubiKey: {dev.descriptor.product_name} (serial={dev.descriptor.serial_number})")
+    # FIDO2 devices (only check for gold tier)
+    if tier == "gold":
+        if not FIDO2_AVAILABLE:
+            print("YubiKey: FIDO2 library NOT INSTALLED — pip install fido2")
+        else:
+            from fido import list_devices, get_registered_credentials
+            devices = list_devices()
+            if devices:
+                dev = devices[0]
+                print(f"YubiKey: {dev.descriptor.product_name} (serial={dev.descriptor.serial_number})")
+            else:
+                print("YubiKey: NOT FOUND")
+
+            # Registered credentials
+            fido2_cfg = cfg.get("fido2", {})
+            store = fido2_cfg.get("credential_store", "")
+            creds = get_registered_credentials(store)
+            print(f"Registered credentials: {len(creds)}")
     else:
-        print("YubiKey: NOT FOUND")
-
-    # Registered credentials
-    fido2_cfg = cfg.get("fido2", {})
-    store = fido2_cfg.get("credential_store", "")
-    creds = get_registered_credentials(store)
-    print(f"Registered credentials: {len(creds)}")
+        print(f"YubiKey: not required (silver tier)")
+        print(f"python-fido2: {'installed' if FIDO2_AVAILABLE else 'not installed (OK for silver tier)'}")
 
     # Bitwarden CLI
     bw_path = shutil.which("bw")
@@ -257,6 +286,94 @@ def cmd_test_ntfy():
         sys.exit(1)
 
 
+def cmd_test_phone():
+    """Test the phone-only approval flow end-to-end.
+
+    Sends a test approval request via Ntfy with Approve/Deny buttons.
+    Confirms that the phone can reach the callback URL and trigger
+    the approval.  Useful for verifying silver tier (phone-only) setup.
+    """
+    import time
+
+    from approvals import ApprovalQueue, ApprovalState
+    from notifications import send_approval_notification
+
+    cfg = load_config()
+    notif_cfg = cfg.get("notifications", {})
+
+    print("Credential Gate — Test Phone Approval Flow")
+    print("=" * 50)
+
+    tier = cfg.get("security_tier", "gold")
+    print(f"\nSecurity tier: {tier}")
+
+    if not notif_cfg.get("enabled", False):
+        print("\nNotifications are disabled in config.yaml.")
+        print("Phone approval requires notifications. Enable them first.")
+        sys.exit(1)
+
+    callback_url = notif_cfg.get("callback_base_url", "")
+    if not callback_url:
+        print("\nNo callback_base_url configured.")
+        print("Phone approval buttons need to reach this URL.")
+        sys.exit(1)
+
+    print(f"Ntfy server:  {notif_cfg.get('ntfy_server', '')}")
+    print(f"Ntfy topic:   {notif_cfg.get('ntfy_topic', '')}")
+    print(f"Callback URL: {callback_url}")
+
+    queue = ApprovalQueue()
+    pending = queue.create(
+        agent_id="test-phone-setup",
+        credential_name="test-credential",
+        purpose="Phone approval test from setup.py",
+        fields=["password"],
+    )
+
+    print(f"\nSending approval request (ID: {pending.request_id[:12]}...)")
+
+    sent = send_approval_notification(
+        config=cfg,
+        request_id=pending.request_id,
+        agent_id="test-phone-setup",
+        credential_name="test-credential",
+        purpose="Phone approval test — tap APPROVE to confirm",
+    )
+
+    if not sent:
+        print("Failed to send notification. Check Ntfy settings.")
+        sys.exit(1)
+
+    print("Notification sent! Check your phone.")
+    print(f"\nWaiting up to 60 seconds for phone approval...")
+    print("  Tap APPROVE on your phone to complete the test.")
+    print("  Tap DENY or wait 60s to test denial flow.\n")
+
+    # Note: this test works without the server running because
+    # the callback URL is just for Ntfy to know where to send the
+    # HTTP request. The actual queue.wait here simulates the server.
+    # In real operation, the server's /approve/{id} endpoint handles it.
+    print("(For this test to work, the Credential Gate server must be running")
+    print(f" at {callback_url} so Ntfy can reach the /approve endpoint.)\n")
+
+    state = queue.wait(pending.request_id, timeout=60)
+
+    if state == ApprovalState.APPROVED:
+        print("Phone approval SUCCEEDED!")
+        print("Your phone-only setup is working correctly.")
+    elif state == ApprovalState.DENIED:
+        print("Phone approval was DENIED (expected if you tapped Deny).")
+        print("The denial flow is working correctly.")
+    else:
+        print("Phone approval TIMED OUT.")
+        print("\nPossible issues:")
+        print(f"  1. Is the Credential Gate server running at {callback_url}?")
+        print("  2. Can Ntfy reach the callback URL? (must be network-accessible)")
+        print("  3. Did you receive the notification on your phone?")
+        print("  4. Check the Ntfy topic subscription in the Ntfy app.")
+        sys.exit(1)
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -269,6 +386,7 @@ def main():
         "check": cmd_check,
         "store-password": cmd_store_password,
         "test-ntfy": cmd_test_ntfy,
+        "test-phone": cmd_test_phone,
     }
 
     fn = commands.get(cmd)

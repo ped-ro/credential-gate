@@ -1,3 +1,8 @@
+# Phase 12: Security tier
+#   "gold"   — YubiKey + phone (requires python-fido2 and a registered YubiKey)
+#   "silver" — phone-only (no YubiKey needed; elevated approval uses 6-digit codes)
+security_tier: "silver"  # "gold" or "silver"
+
 server:
   host: "127.0.0.1"
   port: 8200
@@ -165,6 +170,14 @@ offline:
       standard: 4.0
       high: 1.0
       critical: 0.0  # hardcoded, cannot be overridden
+
+# Phase 12: Elevated approval settings (silver tier)
+# When security_tier is "silver", operations that normally require YubiKey
+# (panic lock/unlock, scan, rotate) use elevated phone approval instead:
+# a 6-digit code pushed via Ntfy that must be echoed back.
+elevated_approval:
+  timeout_seconds: 120  # how long the 6-digit code is valid
+  code_length: 6        # number of digits in the confirmation code
 
 audit:
   db_path: "data/audit.db"
