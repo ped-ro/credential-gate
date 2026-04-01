@@ -4,7 +4,7 @@ A lightweight, self-contained HTML dashboard served at GET /dashboard.
 No external dependencies — all HTML, CSS, and JS inline in a single template.
 Auto-refreshes by polling /stats and /leases every 10 seconds.
 
-Phase 8 implementation.
+Phase 8 implementation. Phase 11: circuit breaker + cache indicators.
 """
 
 DASHBOARD_HTML = """\
@@ -55,6 +55,13 @@ a{color:var(--blue);text-decoration:none}
 .btn-unlock{background:var(--green);color:#fff;border:none;padding:10px 24px;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;font-family:var(--font);text-transform:uppercase;letter-spacing:1px;display:none}
 .btn-unlock:hover{opacity:0.85}
 .btn-unlock.visible{display:inline-block}
+
+/* Offline banner (Phase 11) */
+.offline-banner{background:#d2992244;border:2px solid var(--yellow);border-radius:8px;padding:16px 20px;margin-bottom:16px;display:none;text-align:center}
+.offline-banner.visible{display:block}
+.offline-banner h2{color:var(--yellow);font-size:18px;margin-bottom:8px}
+.offline-banner .offline-details{font-size:13px;color:var(--fg);margin-bottom:8px}
+.offline-banner .offline-cache{font-size:12px;color:var(--fg2)}
 
 /* Anomaly banner */
 .anomaly-banner{background:#f8514922;border:1px solid var(--red);border-radius:8px;padding:12px 16px;margin-bottom:16px;display:none}
@@ -109,6 +116,7 @@ tr.info td{border-left:3px solid var(--blue)}
   <div class="status-item"><span class="dot" id="dot-mcp"></span><span id="st-mcp">MCP</span></div>
   <div class="status-item"><span class="dot" id="dot-proxy"></span><span id="st-proxy">Proxy</span></div>
   <div class="status-item"><span class="dot" id="dot-obs"></span><span id="st-obs">Observability</span></div>
+  <div class="status-item"><span class="dot" id="dot-offline"></span><span id="st-offline">Offline</span></div>
   <div class="status-item" style="color:var(--fg2);font-size:11px" id="last-update"></div>
 </div>
 
@@ -117,6 +125,13 @@ tr.info td{border-left:3px solid var(--blue)}
   <h2>GATE LOCKED</h2>
   <div class="lock-details" id="lock-details"></div>
   <div class="lock-duration" id="lock-duration"></div>
+</div>
+
+<!-- Offline Banner (Phase 11) -->
+<div class="offline-banner" id="offline-banner">
+  <h2>OFFLINE MODE</h2>
+  <div class="offline-details" id="offline-details">Bitwarden unreachable — serving from encrypted cache where available</div>
+  <div class="offline-cache" id="offline-cache"></div>
 </div>
 
 <!-- Panic / Unlock Controls (Phase 10) -->
@@ -131,6 +146,7 @@ tr.info td{border-left:3px solid var(--blue)}
   <div class="card"><div class="label">Approval Rate</div><div class="value" id="c-approval">—</div><div class="trend" id="c-approval-trend"></div></div>
   <div class="card"><div class="label">Active Leases</div><div class="value" id="c-leases">—</div><div class="trend" id="c-leases-trend"></div></div>
   <div class="card"><div class="label">Proxy Executions</div><div class="value" id="c-proxy">—</div><div class="trend" id="c-proxy-trend"></div></div>
+  <div class="card"><div class="label">Cache Entries</div><div class="value" id="c-cache">—</div><div class="trend" id="c-cache-trend"></div></div>
 </div>
 
 <!-- Anomaly Banner -->
@@ -157,7 +173,7 @@ tr.info td{border-left:3px solid var(--blue)}
   <tbody id="leases-body"></tbody></table>
 </div>
 
-<div class="footer">Credential Gate &mdash; Phase 10</div>
+<div class="footer">Credential Gate &mdash; Phase 11</div>
 
 </div>
 
@@ -199,6 +215,7 @@ function statusDot(id, color, text) {
 
 function rowClass(status) {
   if (status === "approved" || status === "proxy_executed" || status === "panic_unlocked") return "approved";
+  if (status === "offline_cached") return "info";
   if (status === "denied" || status === "proxy_failed" || status === "panic_locked") return "denied";
   if (status === "timeout") return "timeout";
   if (status === "error") return "error";
@@ -208,6 +225,7 @@ function rowClass(status) {
 function actionLabel(status, purpose) {
   if (status === "panic_locked") return "PANIC LOCK";
   if (status === "panic_unlocked") return "UNLOCK";
+  if (status === "offline_cached") return "Offline Serve";
   if (status === "lease_renewed") return "Lease Renew";
   if (status === "lease_revoked") return "Lease Revoke";
   if (status === "lease_expired") return "Lease Expired";
@@ -245,6 +263,30 @@ async function refresh() {
     const obs = health.observability;
     statusDot("obs", obs === "enabled" ? "green" : "yellow", "Obs: " + (obs || "unknown"));
 
+    // Circuit breaker / offline status (Phase 11)
+    const cb = health.circuit_breaker || {};
+    const cache = health.cache || {};
+    const offlineEnabled = health.offline === "enabled";
+    if (!offlineEnabled) {
+      statusDot("offline", "yellow", "Offline: off");
+    } else if (cb.state === "open") {
+      statusDot("offline", "red", "CB: OPEN");
+    } else if (cb.state === "half_open") {
+      statusDot("offline", "yellow", "CB: testing");
+    } else {
+      statusDot("offline", "green", "CB: closed");
+    }
+
+    // Offline banner (Phase 11)
+    const offlineBanner = document.getElementById("offline-banner");
+    if (cb.state === "open") {
+      offlineBanner.classList.add("visible");
+      document.getElementById("offline-details").textContent = "Bitwarden unreachable (failures: " + (cb.failure_count || 0) + ") — serving from encrypted cache where available";
+      document.getElementById("offline-cache").textContent = "Cached entries: " + (cache.entries || 0);
+    } else {
+      offlineBanner.classList.remove("visible");
+    }
+
     // Lock banner (Phase 10)
     const panic = health.panic || {};
     const lockBanner = document.getElementById("lock-banner");
@@ -277,6 +319,11 @@ async function refresh() {
     document.getElementById("c-approval").textContent = rq.total > 0 ? (rq.approval_rate * 100).toFixed(1) + "%" : "—";
     document.getElementById("c-leases").textContent = ls.active ?? "—";
     document.getElementById("c-proxy").textContent = px.executions_today ?? "—";
+
+    // Cache entries card (Phase 11) — from health, not stats
+    if (health && health.cache) {
+      document.getElementById("c-cache").textContent = health.cache.entries ?? "—";
+    }
 
     // Trends vs previous fetch
     if (prevStats) {

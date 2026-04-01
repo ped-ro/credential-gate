@@ -35,6 +35,15 @@ class BitwardenError(Exception):
     pass
 
 
+class BitwardenUnavailableError(BitwardenError):
+    """Raised when the circuit breaker is open or Bitwarden failed.
+
+    Distinct from other BW errors — signals that the caller should
+    check the offline cache for a cached credential.
+    """
+    pass
+
+
 class SessionState(enum.Enum):
     """Bitwarden session lifecycle states."""
     NO_SESSION = "no_session"

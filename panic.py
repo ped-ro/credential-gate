@@ -39,6 +39,7 @@ class PanicManager:
         self._bw = bitwarden
         self._notifier_config = notifier_config
         self._audit = audit
+        self._credential_cache = None
         self._lock_file = Path(data_dir) / "lock.json"
 
         # In-memory state
@@ -135,6 +136,13 @@ class PanicManager:
             leases_revoked = self._lease_mgr.revoke_all(agent_id=agent_filter)
             logger.warning("Panic: revoked %d active lease(s)", leases_revoked)
 
+        # 2b. Evict all cached credentials (Phase 11)
+        cache_evicted = 0
+        if self._credential_cache:
+            cache_evicted = self._credential_cache.evict_all()
+            if cache_evicted:
+                logger.warning("Panic: evicted %d cached credential(s)", cache_evicted)
+
         # 3. Optional credential rotation
         credentials_rotated = 0
         if rotate_credentials and self._bw:
@@ -182,6 +190,7 @@ class PanicManager:
         return {
             "status": "locked",
             "leases_revoked": leases_revoked,
+            "cache_evicted": cache_evicted,
             "credentials_rotated": credentials_rotated,
             "notification_sent": notification_sent,
             "locked_at": locked_at_iso,
@@ -264,6 +273,14 @@ class PanicManager:
     def set_cooldown(self, seconds: int) -> None:
         """Set the cooldown period from config."""
         self._cooldown_seconds = seconds
+
+    def set_credential_cache(self, cache) -> None:
+        """Set the credential cache (Phase 11).
+
+        Called after the cache is initialized in the lifespan, since cache
+        init may fail and happens after PanicManager creation.
+        """
+        self._credential_cache = cache
 
     # ------------------------------------------------------------------
     # Lock status (for GET /lock-status)

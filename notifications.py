@@ -758,6 +758,115 @@ def send_identity_violation_notification(
         return False
 
 
+def send_circuit_breaker_notification(
+    new_state: str,
+    failure_count: int,
+    config: dict,
+) -> bool:
+    """Circuit breaker state change notification.
+
+    OPEN: Priority urgent (5), tags: warning.
+        'Bitwarden unreachable after N failures. Serving from cache where available.'
+    CLOSED: Priority default (3), tags: white_check_mark.
+        'Bitwarden connectivity restored.'
+    Never raises.
+    """
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        if new_state == "open":
+            message = (
+                f"Bitwarden unreachable after {failure_count} consecutive failures.\n"
+                f"Serving from offline cache where available.\n"
+                f"Circuit breaker is OPEN."
+            )
+            title = "Credential Gate \u2014 Bitwarden Unavailable"
+            priority = "urgent"
+            tags = "warning"
+        else:
+            message = (
+                "Bitwarden connectivity restored.\n"
+                "Circuit breaker is CLOSED \u2014 normal operations resumed."
+            )
+            title = "Credential Gate \u2014 Bitwarden Restored"
+            priority = "default"
+            tags = "white_check_mark"
+
+        headers = {
+            "Title": title,
+            "Priority": priority,
+            "Tags": tags,
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Circuit breaker notification sent (state=%s)", new_state)
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for circuit breaker notification", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send circuit breaker notification: %s", e)
+        return False
+
+
+def send_offline_serve_notification(
+    credential_name: str,
+    agent_id: str,
+    config: dict,
+) -> bool:
+    """Notification when a credential is served from offline cache.
+
+    Priority: high (4), tags: floppy_disk.
+    'Served {credential} to {agent} from offline cache (Bitwarden unavailable)'
+    Never raises.
+    """
+    try:
+        ntfy_server = config["notifications"]["ntfy_server"]
+        ntfy_topic = config["notifications"]["ntfy_topic"]
+
+        message = (
+            f"Served '{credential_name}' to {agent_id} from offline cache\n"
+            f"(Bitwarden unavailable)"
+        )
+
+        headers = {
+            "Title": "Credential Gate \u2014 Offline Cache Serve",
+            "Priority": "high",
+            "Tags": "floppy_disk",
+        }
+
+        ntfy_token = config["notifications"].get("ntfy_token")
+        if ntfy_token:
+            headers["Authorization"] = f"Bearer {ntfy_token}"
+
+        url = f"{ntfy_server.rstrip('/')}/{ntfy_topic}"
+        data = message.encode()
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status < 300:
+                logger.info("Offline serve notification sent for '%s'", credential_name)
+                return True
+            else:
+                logger.warning("Ntfy returned status %d for offline serve notification", resp.status)
+                return False
+
+    except Exception as e:
+        logger.warning("Failed to send offline serve notification: %s", e)
+        return False
+
+
 def test_ntfy(config: dict) -> bool:
     """Send a test notification to verify Ntfy connectivity.
 

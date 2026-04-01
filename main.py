@@ -19,6 +19,9 @@ detection, and daily digest notifications.
 
 Phase 9: Secret discovery — scan codebases for hardcoded secrets,
 vault them in Bitwarden, track credential ages, and one-click rotation.
+
+Phase 11: Offline resilience — encrypted credential cache, circuit
+breaker for Bitwarden, and crash recovery with graceful degradation.
 """
 
 import logging
@@ -33,7 +36,7 @@ from pydantic import BaseModel
 
 from approvals import ApprovalQueue, ApprovalState
 from audit import AuditLog
-from bitwarden import BitwardenError, BitwardenSessionManager, SessionState
+from bitwarden import BitwardenError, BitwardenUnavailableError, BitwardenSessionManager, SessionState
 from config import load_config
 from fido import AssertionResult, assert_touch
 from leases import LeaseManager, LeaseState, _ts_to_iso
@@ -44,10 +47,12 @@ from notifications import (
     send_approval_notification,
     send_approved_notification,
     send_auto_approve_notification,
+    send_circuit_breaker_notification,
     send_daily_digest_notification,
     send_identity_violation_notification,
     send_lease_expired_notification,
     send_lease_revoked_notification,
+    send_offline_serve_notification,
     send_revoke_all_notification,
     send_rotation_complete_notification,
     send_rotation_failed_notification,
@@ -96,6 +101,10 @@ _SCAN_CACHE_TTL = 600  # 10 minutes
 
 # Phase 10: Emergency Kill + Hardened Identity
 panic_mgr: PanicManager | None = None
+
+# Phase 11: Offline + Resilience
+credential_cache = None  # type: ignore
+circuit_breaker = None  # type: ignore
 
 
 @asynccontextmanager
@@ -177,6 +186,71 @@ async def lifespan(app: FastAPI):
     if panic_mgr.is_locked:
         logger.critical("SERVICE STARTING IN LOCKED MODE — gate is LOCKED")
 
+    # Initialize offline resilience (Phase 11)
+    global credential_cache, circuit_breaker
+    offline_cfg = cfg.get("offline", {})
+    if offline_cfg.get("enabled", False):
+        from cache import EncryptedCredentialCache
+        from circuit_breaker import BitwardenCircuitBreaker
+
+        cache_path = str(Path(cfg["audit"]["db_path"]).parent / "credential_cache.enc")
+        credential_cache = EncryptedCredentialCache(cache_path, cfg)
+
+        circuit_breaker = BitwardenCircuitBreaker(cfg, notifier=cfg)
+
+        # Derive cache encryption key from YubiKey
+        try:
+            from fido import get_device, get_registered_credentials
+
+            fido2_cfg = cfg.get("fido2", {})
+            store = fido2_cfg.get("credential_store", "")
+            creds = get_registered_credentials(store)
+            if creds:
+                device = get_device()
+                if device:
+                    from fido2.client import Fido2Client, UserInteraction
+                    from fido2.server import Fido2Server
+
+                    rp_id = fido2_cfg.get("rp_id", "credential-gate.local")
+                    rp_name = fido2_cfg.get("rp_name", "Credential Gate")
+                    server = Fido2Server({"id": rp_id, "name": rp_name})
+
+                    class _NoPrompt(UserInteraction):
+                        def prompt_up(self):
+                            print("\n  >>> Touch YubiKey to derive cache encryption key <<<\n")
+                        def request_pin(self, permissions, rd_id):
+                            return None
+                        def request_uv(self, permissions, rd_id):
+                            return True
+
+                    client = Fido2Client(device, f"https://{rp_id}", user_interaction=_NoPrompt())
+                    options, state = server.authenticate_begin(creds)
+                    result = client.get_assertion(options)
+                    response = result.get_response(0)
+                    server.authenticate_complete(state, creds, response)
+
+                    # Use authenticator_data + signature as key material
+                    key_material = response.authenticator_data + response.signature
+                    credential_cache.derive_key(key_material)
+                    logger.info("Offline cache initialized (key derived from YubiKey)")
+                else:
+                    logger.warning("No YubiKey detected — offline cache NOT initialized")
+            else:
+                logger.warning("No FIDO2 credentials registered — offline cache NOT initialized")
+        except Exception as e:
+            logger.warning("Failed to initialize offline cache key: %s", e)
+
+        logger.info("Circuit breaker enabled (threshold=%d, recovery=%ds)",
+            offline_cfg.get("circuit_breaker", {}).get("failure_threshold", 3),
+            offline_cfg.get("circuit_breaker", {}).get("recovery_timeout_seconds", 60),
+        )
+    else:
+        logger.info("Offline resilience disabled (set offline.enabled: true to enable)")
+
+    # Wire credential cache into panic manager (Phase 11)
+    if panic_mgr and credential_cache:
+        panic_mgr.set_credential_cache(credential_cache)
+
     # Initialize discovery & rotation (Phase 9)
     global secret_scanner, credential_rotator, auto_vaulter
     disc_cfg = cfg.get("discovery", {})
@@ -211,6 +285,8 @@ async def lifespan(app: FastAPI):
             credential_rotator=credential_rotator,
             auto_vaulter=auto_vaulter,
             panic_manager=panic_mgr,
+            credential_cache=credential_cache,
+            circuit_breaker_inst=circuit_breaker,
         )
         mcp_app = mcp_srv.streamable_http_app()
         mcp_path = mcp_cfg.get("path", "/mcp")
@@ -462,9 +538,17 @@ async def health():
     lock_status = panic_mgr.get_status() if panic_mgr else {"locked": False}
     is_locked = lock_status.get("locked", False)
 
-    # Overall status: locked overrides everything
+    # Phase 11: Circuit breaker & cache status
+    cb_status = circuit_breaker.get_status() if circuit_breaker else {"state": "disabled"}
+    cache_stats = credential_cache.stats() if credential_cache else {"initialized": False}
+    offline_cfg = cfg.get("offline", {})
+    offline_status = "enabled" if offline_cfg.get("enabled", False) else "disabled"
+
+    # Overall status: locked overrides everything, then circuit breaker
     if is_locked:
         overall_status = "locked"
+    elif circuit_breaker and cb_status.get("state") == "open":
+        overall_status = "degraded_offline"
     elif bw_status == "active":
         overall_status = "ok"
     else:
@@ -484,6 +568,9 @@ async def health():
         "discovery": discovery_status,
         "rotation": rotation_status,
         "panic": lock_status,
+        "circuit_breaker": cb_status,
+        "cache": cache_stats,
+        "offline": offline_status,
     }
 
 
@@ -711,6 +798,24 @@ async def get_lock_status():
     if not panic_mgr:
         return {"locked": False}
     return panic_mgr.get_status()
+
+
+# ---------------------------------------------------------------------------
+# Offline Cache endpoint (Phase 11)
+# ---------------------------------------------------------------------------
+
+@app.get("/cache/status")
+async def get_cache_status():
+    """Return offline cache statistics. No auth required — no secrets exposed."""
+    if not credential_cache:
+        return {"enabled": False, "message": "Offline cache not enabled"}
+    stats = credential_cache.stats()
+    cb = circuit_breaker.get_status() if circuit_breaker else {"state": "disabled"}
+    return {
+        "enabled": True,
+        "cache": stats,
+        "circuit_breaker": cb,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -982,6 +1087,10 @@ async def rotate_credential(credential_name: str, request: Request):
 
     rotation_result = await credential_rotator.rotate(credential_name, credential_type)
 
+    # Phase 11: Evict from cache after rotation (stale value)
+    if rotation_result.success and credential_cache:
+        credential_cache.evict(credential_name)
+
     audit_log.log(
         agent_id="admin",
         credential_name=credential_name,
@@ -1046,6 +1155,9 @@ def _lease_expiry_daemon():
                     try:
                         bw.rotate_credential(lease.credential_name)
                         rotated = True
+                        # Phase 11: Evict from cache (stale after rotation)
+                        if credential_cache:
+                            credential_cache.evict(lease.credential_name)
                         logger.info(
                             "Rotated credential '%s' after lease %s expired",
                             lease.credential_name, lease.lease_id[:12],
@@ -1088,6 +1200,22 @@ def _lease_expiry_daemon():
             _run_anomaly_check()
         except Exception as e:
             logger.error("Anomaly check error: %s", e)
+
+        # Phase 11: Evict expired cache entries
+        try:
+            if credential_cache and credential_cache.is_initialized():
+                evicted = credential_cache.evict_expired()
+                if evicted:
+                    logger.info("Cache daemon: evicted %d expired entries", evicted)
+        except Exception as e:
+            logger.error("Cache expiry check error: %s", e)
+
+        # Phase 11: Circuit breaker long-open reminder
+        try:
+            if circuit_breaker and circuit_breaker.check_open_too_long():
+                logger.warning("Circuit breaker has been OPEN for too long")
+        except Exception as e:
+            logger.error("Circuit breaker check error: %s", e)
 
         _expiry_stop.wait(30)
     logger.info("Lease expiry daemon stopped")
@@ -2250,11 +2378,54 @@ def _finalize_approval(
     alert_always: bool = False, policy_checks: list[dict] | None = None,
     lease_policy: LeasePolicy | None = None,
 ) -> CredentialResponse:
-    """Fetch credential from Bitwarden, create a lease, and return response."""
-    try:
-        extracted = _fetch_credential(req)
-    except BitwardenError as e:
-        logger.error("Bitwarden error: %s", e)
+    """Fetch credential from Bitwarden, create a lease, and return response.
+
+    Phase 11: If Bitwarden is unreachable and the circuit breaker is open,
+    falls back to the encrypted offline cache.  Offline serves are logged
+    with status 'offline_cached' and require prior YubiKey approval.
+    """
+    extracted = None
+    served_offline = False
+
+    # Phase 11: Check circuit breaker — should we even try Bitwarden?
+    should_try_bw = True
+    if circuit_breaker and not circuit_breaker.should_attempt_bitwarden():
+        should_try_bw = False
+
+    if should_try_bw:
+        try:
+            extracted = _fetch_credential(req)
+            # Record success for circuit breaker
+            if circuit_breaker:
+                circuit_breaker.record_success()
+        except BitwardenError as e:
+            logger.error("Bitwarden error: %s", e)
+            # Record failure for circuit breaker
+            if circuit_breaker:
+                circuit_breaker.record_failure(str(e))
+
+    # Phase 11: If Bitwarden fetch failed or was skipped, try offline cache
+    if extracted is None and credential_cache and credential_cache.is_initialized():
+        cached = credential_cache.get(req.credential_name)
+        if cached:
+            # Filter to requested fields only
+            extracted = {f: cached.get(f) for f in req.fields if f in cached}
+            if extracted:
+                served_offline = True
+                logger.warning(
+                    "Serving '%s' from offline cache for %s (Bitwarden unavailable)",
+                    req.credential_name, req.agent_id,
+                )
+                if _notifications_enabled():
+                    send_offline_serve_notification(
+                        credential_name=req.credential_name,
+                        agent_id=req.agent_id,
+                        config=cfg,
+                    )
+
+    # If we still don't have the credential, deny
+    if not extracted:
+        error_reason = "Bitwarden unavailable and no cached copy" if (circuit_breaker and not should_try_bw) else "Bitwarden error"
         audit_log.log(
             agent_id=req.agent_id,
             credential_name=req.credential_name,
@@ -2265,7 +2436,27 @@ def _finalize_approval(
             response_time_ms=_elapsed_ms(start),
             policy_checks=policy_checks,
         )
-        return CredentialResponse(status="denied", reason=f"Bitwarden error: {e}")
+        return CredentialResponse(status="denied", reason=error_reason)
+
+    # Phase 11: Populate cache after successful live Bitwarden fetch
+    if not served_offline and credential_cache and credential_cache.is_initialized():
+        risk_level = "standard"
+        if policy_checks:
+            # Try to get risk from the policy context
+            for check in policy_checks:
+                if check.get("risk"):
+                    risk_level = check["risk"]
+                    break
+        try:
+            from policy import load_agent_policy
+            policies_dir = cfg.get("policies", {}).get("directory", "policies")
+            agent_policy = load_agent_policy(policies_dir, req.agent_id)
+            if agent_policy:
+                cred_cfg = agent_policy.get_credential_policy(req.credential_name)
+                risk_level = cred_cfg.get("risk", "standard")
+        except Exception:
+            pass
+        credential_cache.store(req.credential_name, extracted, risk_level=risk_level)
 
     # --- Check concurrent lease limit ---
     if lease_policy:
@@ -2298,10 +2489,11 @@ def _finalize_approval(
         approval_method=method,
     )
 
+    status_label = "offline_cached" if served_offline else "approved"
     audit_log.log(
         agent_id=req.agent_id,
         credential_name=req.credential_name,
-        status="approved",
+        status=status_label,
         fields_requested=req.fields,
         purpose=req.purpose,
         ip_address=client_ip,
@@ -2309,9 +2501,10 @@ def _finalize_approval(
         policy_checks=policy_checks,
     )
 
+    source = "offline cache" if served_offline else method
     logger.info(
         "Credential '%s' approved for %s via %s (lease %s, TTL %ds)",
-        req.credential_name, req.agent_id, method,
+        req.credential_name, req.agent_id, source,
         lease.lease_id[:12], ttl,
     )
 

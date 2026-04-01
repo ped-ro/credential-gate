@@ -32,6 +32,8 @@ def create_mcp_server(
     credential_rotator=None,
     auto_vaulter=None,
     panic_manager=None,
+    credential_cache=None,
+    circuit_breaker_inst=None,
 ) -> FastMCP:
     """Create and configure the MCP server with all tools.
 
@@ -494,8 +496,16 @@ def create_mcp_server(
         lock_status = panic_manager.get_status() if panic_manager else {"locked": False}
         is_locked = lock_status.get("locked", False)
 
+        # Phase 11: Circuit breaker & cache status
+        cb_status = circuit_breaker_inst.get_status() if circuit_breaker_inst else {"state": "disabled"}
+        cache_stats = credential_cache.stats() if credential_cache else {"initialized": False}
+        offline_cfg = config.get("offline", {})
+        offline_status = "enabled" if offline_cfg.get("enabled", False) else "disabled"
+
         if is_locked:
             overall_status = "locked"
+        elif circuit_breaker_inst and cb_status.get("state") == "open":
+            overall_status = "degraded_offline"
         elif bw_status == "active":
             overall_status = "ok"
         else:
@@ -516,6 +526,9 @@ def create_mcp_server(
             "discovery": discovery_status,
             "rotation": rotation_status,
             "panic": lock_status,
+            "circuit_breaker": cb_status,
+            "cache": cache_stats,
+            "offline": offline_status,
         })
 
     @mcp.tool(
@@ -962,5 +975,30 @@ def create_mcp_server(
 
         summary = await panic_manager.panic(reason=f"{reason} (triggered by {agent_id})")
         return json.dumps(summary)
+
+    # -- Phase 11: Cache status tool -----------------------------------------
+
+    @mcp.tool(
+        description=(
+            "Get offline cache and circuit breaker status. Returns cache "
+            "statistics (entries, ages, size), circuit breaker state, and "
+            "whether offline mode is active. No secrets are exposed."
+        ),
+    )
+    async def get_cache_status() -> str:
+        if not credential_cache:
+            return json.dumps({
+                "offline_enabled": False,
+                "message": "Offline resilience not enabled",
+            })
+
+        cache_stats = credential_cache.stats()
+        cb = circuit_breaker_inst.get_status() if circuit_breaker_inst else {"state": "disabled"}
+
+        return json.dumps({
+            "offline_enabled": True,
+            "cache": cache_stats,
+            "circuit_breaker": cb,
+        })
 
     return mcp

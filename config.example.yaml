@@ -147,5 +147,24 @@ panic:
     # Lock gate if an unknown agent ID appears in audit logs
     unknown_agent_lockdown: true
 
+offline:
+  enabled: true
+  circuit_breaker:
+    # Number of consecutive Bitwarden failures before opening circuit
+    failure_threshold: 3
+    # How long (seconds) before trying Bitwarden again after circuit opens
+    recovery_timeout_seconds: 60
+    # Send reminder notification if circuit is open longer than this
+    max_open_duration_seconds: 300
+  cache:
+    # Maximum number of credentials to cache
+    max_entries: 50
+    # Cache TTL by risk level (hours). Critical is ALWAYS 0 — never cached.
+    ttl_by_risk:
+      low: 8.0
+      standard: 4.0
+      high: 1.0
+      critical: 0.0  # hardcoded, cannot be overridden
+
 audit:
   db_path: "data/audit.db"
